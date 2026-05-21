@@ -37,7 +37,8 @@ AUTO_PUBLIC_FROM_OUTBOUND="${AUTO_PUBLIC_FROM_OUTBOUND:-auto}"
 AUTO_NGROK_PUBLIC="${AUTO_NGROK_PUBLIC:-off}"
 AUTO_SCAN_PLATFORM_ENDPOINT="${AUTO_SCAN_PLATFORM_ENDPOINT:-on}"
 AUTO_WAIT_PUBLIC_ENDPOINT="${AUTO_WAIT_PUBLIC_ENDPOINT:-on}"
-PUBLIC_ENDPOINT_WAIT_SECONDS="${PUBLIC_ENDPOINT_WAIT_SECONDS:-35}"
+AUTO_USE_EXISTING_NGROK="${AUTO_USE_EXISTING_NGROK:-on}"
+PUBLIC_ENDPOINT_WAIT_SECONDS="${PUBLIC_ENDPOINT_WAIT_SECONDS:-20}"
 ALLOW_PRIVATE_PUBLIC_HOST="${ALLOW_PRIVATE_PUBLIC_HOST:-off}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
@@ -247,6 +248,89 @@ detect_endpoint_from_processes(){
   return 1
 }
 
+parse_existing_ngrok_text(){
+  local _tmp _rc
+  _tmp="$(mktemp)"
+  cat > "$_tmp"
+  python3 - "$_tmp" <<'PY'
+import re, sys
+text=open(sys.argv[1], 'r', encoding='utf-8', errors='ignore').read(2_000_000)
+host=port=local=''
+m=re.search(r'tcp://([A-Za-z0-9_.-]+):([0-9]{2,5})', text)
+if m:
+    host, port = m.group(1), m.group(2)
+m2=re.search(r'addr=//(?:localhost|127\.0\.0\.1):([0-9]{1,5})', text)
+if m2:
+    local=m2.group(1)
+if not local:
+    m3=re.search(r'ngrok\s+tcp\b[^\n\r]*\s([0-9]{1,5})(?:\s|$)', text)
+    if m3:
+        local=m3.group(1)
+if host and port:
+    print(host, port, local or '22')
+    sys.exit(0)
+sys.exit(1)
+PY
+  _rc=$?
+  rm -f "$_tmp"
+  return "$_rc"
+}
+
+detect_existing_ngrok_endpoint(){
+  [ "$AUTO_USE_EXISTING_NGROK" = "on" ] || return 1
+  local parsed host port local file
+
+  if have curl; then
+    local api_json
+    api_json="$(mktemp)"
+    if curl -fsS --connect-timeout 1 --max-time 2 http://127.0.0.1:4040/api/tunnels -o "$api_json" 2>/dev/null; then
+      parsed="$(python3 - "$api_json" <<'PY' 2>/dev/null || true
+import json, sys, re
+try:
+    data=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+for t in data.get('tunnels', []):
+    u=t.get('public_url') or ''
+    if not u.startswith('tcp://'):
+        continue
+    hp=u[6:]
+    if ':' not in hp:
+        continue
+    host, port=hp.rsplit(':',1)
+    addr=str((t.get('config') or {}).get('addr') or '')
+    m=re.search(r':([0-9]{1,5})$', addr)
+    print(host, port, m.group(1) if m else '22')
+    sys.exit(0)
+sys.exit(1)
+PY
+)"
+    else
+      parsed=""
+    fi
+    rm -f "$api_json"
+    if [ -n "$parsed" ]; then
+      read -r host port local <<<"$parsed"
+      host_is_probably_public "$host" && { printf '%s\t%s\t%s\texisting-ngrok-api\n' "$host" "$port" "$local"; return 0; }
+    fi
+  fi
+
+  for file in /root/ngrok_ssh_info.txt /etc/ngrok-ssh/run/ngrok-ssh.log /etc/ngrok-ssh/run/ngrok-ssh.sh; do
+    [ -r "$file" ] || continue
+    parsed="$(cat "$file" 2>/dev/null | parse_existing_ngrok_text 2>/dev/null || true)"
+    [ -n "$parsed" ] || continue
+    read -r host port local <<<"$parsed"
+    host_is_probably_public "$host" && { printf '%s\t%s\t%s\texisting-ngrok:%s\n' "$host" "$port" "${local:-22}" "$file"; return 0; }
+  done
+
+  parsed="$(ps -eo args= 2>/dev/null | grep -E 'ngrok tcp' | parse_existing_ngrok_text 2>/dev/null || true)"
+  if [ -n "$parsed" ]; then
+    read -r host port local <<<"$parsed"
+    host_is_probably_public "$host" && { printf '%s\t%s\t%s\texisting-ngrok-process\n' "$host" "$port" "${local:-22}"; return 0; }
+  fi
+  return 1
+}
+
 detect_endpoint_from_env(){
   local h p v var parsed
   for var in VPNMUX_PUBLIC_HOST PUBLIC_HOST SSH_PUBLIC_HOST SSH_HOST ZC_SSH_HOST ZO_SSH_HOST ZOCOMPUTER_SSH_HOST; do
@@ -307,7 +391,7 @@ detect_outbound_ip(){
 }
 
 autodetect_public(){
-  local env_ep env_host env_port frp_host frp_port frp_local file_ep file_host file_port file_local file_src proc_ep proc_host proc_port proc_local proc_src
+  local env_ep env_host env_port frp_host frp_port frp_local ng_ep ng_host ng_port ng_local ng_src file_ep file_host file_port file_local file_src proc_ep proc_host proc_port proc_local proc_src
   env_ep="$(detect_endpoint_from_env || true)"
   if [ -n "$env_ep" ]; then
     read -r env_host env_port <<<"$env_ep"
@@ -323,6 +407,14 @@ autodetect_public(){
   MUX_PORT="${MUX_PORT:-$(parse_frpc_value localPort || true)}"
   MUX_PORT="${MUX_PORT:-$frp_local}"
   if [ -n "$frp_host" ] && [ -n "$frp_port" ] && [ -z "${PUBLIC_SOURCE:-}" ]; then PUBLIC_SOURCE="frpc"; fi
+  ng_ep="$(detect_existing_ngrok_endpoint || true)"
+  if [ -n "$ng_ep" ]; then
+    IFS=$'\t' read -r ng_host ng_port ng_local ng_src <<<"$ng_ep"
+    PUBLIC_HOST="${PUBLIC_HOST:-$ng_host}"
+    PUBLIC_PORT="${PUBLIC_PORT:-$ng_port}"
+    MUX_PORT="${MUX_PORT:-$ng_local}"
+    [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="$ng_src"
+  fi
   file_ep="$(detect_endpoint_from_files || true)"
   if [ -n "$file_ep" ]; then
     IFS=$'\t' read -r file_host file_port file_local file_src <<<"$file_ep"
@@ -543,6 +635,10 @@ wait_for_platform_public_endpoint(){
       ok "已发现平台 SSH 公网入口：${PUBLIC_HOST}:${PUBLIC_PORT}（${PUBLIC_SOURCE:-detected}）"
       return 0
     fi
+    now="$(date +%s)"
+    if [ $(( (deadline - now) % 6 )) -eq 0 ] 2>/dev/null; then
+      log "还在等待公网入口写入；已检查环境变量、ngrok 状态、平台配置/日志。"
+    fi
     sleep 2
   done
   return 1
@@ -726,10 +822,25 @@ x25519_keys(){
 }
 
 write_state(){
+  local detected_public_host="$PUBLIC_HOST" detected_public_port="$PUBLIC_PORT" detected_public_ip="$PUBLIC_IP"
+  local detected_outbound_ip="$OUTBOUND_IP" detected_public_source="$PUBLIC_SOURCE"
+  local detected_ngrok_url="$NGROK_URL" detected_ngrok_token="$NGROK_TOKEN_FINGERPRINT"
+  local detected_mux_port="$MUX_PORT" detected_ssh_inner_port="$SSH_INNER_PORT" detected_vmess_port="$VMESS_PORT" detected_reality_port="$REALITY_PORT"
   local detected_sshd_bin="$SSHD_BIN" detected_sshd_opts="$SSHD_EXTRA_OPTS"
   mkdir -p "$WORK" "$OUT" "$WORK/bootstrap"
   chmod 700 "$WORK" "$WORK/bootstrap" 2>/dev/null || true
   if [ -f "$WORK/state.env" ]; then . "$WORK/state.env" || true; fi
+  PUBLIC_HOST="$detected_public_host"
+  PUBLIC_PORT="$detected_public_port"
+  PUBLIC_IP="$detected_public_ip"
+  OUTBOUND_IP="$detected_outbound_ip"
+  PUBLIC_SOURCE="$detected_public_source"
+  NGROK_URL="$detected_ngrok_url"
+  NGROK_TOKEN_FINGERPRINT="$detected_ngrok_token"
+  MUX_PORT="$detected_mux_port"
+  SSH_INNER_PORT="$detected_ssh_inner_port"
+  VMESS_PORT="$detected_vmess_port"
+  REALITY_PORT="$detected_reality_port"
   SSHD_BIN="$detected_sshd_bin"
   SSHD_EXTRA_OPTS="$detected_sshd_opts"
   UUID="${UUID:-$(rand_uuid)}"
