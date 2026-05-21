@@ -23,6 +23,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vp
 - `OUTBOUND_IP`：容器访问公网时暴露的出口 IPv4。
 - SSH 前置条件：缺少 `sshd` 时自动安装 OpenSSH Server，自动生成 host key，创建 `/run/sshd`，必要时先在 `MUX_PORT` 拉起临时 SSH 占位，再切换成 VPNMux。
 - 部署末尾会等待后台切换并做本地 SSH/VMess-WS 验证；若公网入口从容器内无法回连，会给出提示但不直接判死刑。
+- 不再把 `modal`、`localhost`、`127.0.0.1`、内网 IP 或无点短主机名误当公网入口；如果平台没有开启 SSH/TCP 映射，会停止生成客户端配置并提示手动传入 `PUBLIC_HOST` / `PUBLIC_PORT`。
 
 如新容器没有 root 密码，但需要复用端口继续保留 SSH 登录能力，可显式传入：
 
@@ -66,3 +67,4 @@ bash /etc/vpnmux/restore-ssh.sh
 - 对 `dumb-init`、`supervisord`、普通容器环境优先降级到 process/nohup 守护。
 - VPNMux 脚本不绑定 Zcomputer，支持自动捕获公网入口/解析 IP/出口 IP，也支持通过 `PUBLIC_HOST` / `PUBLIC_PORT` / `MUX_PORT` 显式指定入口。
 - VPNMux 会自动补齐 SSH 服务端前置条件；如果平台没有真正给容器做公网端口映射，脚本只能打开容器内监听并在状态页提示公网 TCP 检测失败，不能凭空创建平台外层 NAT/FRP 映射。
+- Zo/Modal 这类 Web Terminal 环境里，容器 hostname 可能是 `modal` 且解析到 `127.0.0.1`；这只是容器内部地址，不能写进客户端配置。必须先开启平台 SSH/TCP 入口，或把平台显示的 `ssh -p 端口 user@host` 拆成 `PUBLIC_HOST=host PUBLIC_PORT=端口` 后部署。

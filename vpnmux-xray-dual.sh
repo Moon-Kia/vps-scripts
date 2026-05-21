@@ -33,6 +33,8 @@ AUTO_INSTALL_SSH="${AUTO_INSTALL_SSH:-on}"
 AUTO_CONFIGURE_SSH="${AUTO_CONFIGURE_SSH:-on}"
 AUTO_BOOTSTRAP_SSH="${AUTO_BOOTSTRAP_SSH:-on}"
 WAIT_HANDOFF="${WAIT_HANDOFF:-on}"
+AUTO_PUBLIC_FROM_OUTBOUND="${AUTO_PUBLIC_FROM_OUTBOUND:-auto}"
+ALLOW_PRIVATE_PUBLIC_HOST="${ALLOW_PRIVATE_PUBLIC_HOST:-off}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 SSHD_EXTRA_OPTS="${SSHD_EXTRA_OPTS:--o PermitRootLogin=yes -o PasswordAuthentication=yes -o PubkeyAuthentication=yes -o UsePAM=no}"
@@ -73,6 +75,108 @@ resolve_host_ip(){
   [ -n "$ip" ] && printf '%s\n' "$ip"
 }
 
+is_ipv4(){
+  local ip="$1" IFS=. a b c d extra
+  [[ "$ip" =~ ^[0-9]+(\.[0-9]+){3}$ ]] || return 1
+  read -r a b c d extra <<<"$ip"
+  [ -z "${extra:-}" ] || return 1
+  for n in "$a" "$b" "$c" "$d"; do
+    [ "$n" -ge 0 ] 2>/dev/null && [ "$n" -le 255 ] 2>/dev/null || return 1
+  done
+}
+
+is_private_ipv4(){
+  local ip="$1" IFS=. a b c d
+  is_ipv4 "$ip" || return 1
+  read -r a b c d <<<"$ip"
+  case "$a" in
+    0|10|127) return 0 ;;
+    169) [ "$b" -eq 254 ] 2>/dev/null && return 0 ;;
+    172) [ "$b" -ge 16 ] 2>/dev/null && [ "$b" -le 31 ] 2>/dev/null && return 0 ;;
+    192) [ "$b" -eq 168 ] 2>/dev/null && return 0 ;;
+    100) [ "$b" -ge 64 ] 2>/dev/null && [ "$b" -le 127 ] 2>/dev/null && return 0 ;;
+    198) [ "$b" -ge 18 ] 2>/dev/null && [ "$b" -le 19 ] 2>/dev/null && return 0 ;;
+  esac
+  [ "$a" -ge 224 ] 2>/dev/null && return 0
+  return 1
+}
+
+modal_like_runtime(){
+  local hn
+  hn="$(hostname 2>/dev/null || true)"
+  case "${hn,,}" in modal|modal-*|*.modal) return 0 ;; esac
+  env 2>/dev/null | grep -Eq '^(MODAL_|MODAL=|ZC_|ZO_|ZOCOMPUTER_)' && return 0
+  return 1
+}
+
+host_is_probably_public(){
+  local host="$1" lower ip
+  [ "$ALLOW_PRIVATE_PUBLIC_HOST" = "on" ] && [ -n "$host" ] && return 0
+  host="${host#[}"
+  host="${host%]}"
+  host="${host%.}"
+  lower="${host,,}"
+  [ -n "$lower" ] || return 1
+  case "$lower" in
+    localhost|localhost.*|modal|modal-*|*.local|*.internal|*.localhost) return 1 ;;
+  esac
+  if is_ipv4 "$host"; then
+    is_private_ipv4 "$host" && return 1
+    return 0
+  fi
+  # Short names such as "modal" or "workspace" only work inside the container/LAN,
+  # not from a phone or an external client.
+  [[ "$host" == *.* ]] || return 1
+  ip="$(resolve_host_ip "$host" || true)"
+  if [ -n "$ip" ] && is_private_ipv4 "$ip"; then return 1; fi
+  return 0
+}
+
+env_var(){
+  local name="$1"
+  eval 'printf "%s\n" "${'"$name"':-}"'
+}
+
+detect_endpoint_from_env(){
+  local h p v var parsed
+  for var in VPNMUX_PUBLIC_HOST PUBLIC_HOST SSH_PUBLIC_HOST SSH_HOST ZC_SSH_HOST ZO_SSH_HOST ZOCOMPUTER_SSH_HOST; do
+    v="$(env_var "$var")"
+    [ -n "$v" ] && { h="$v"; break; }
+  done
+  for var in VPNMUX_PUBLIC_PORT PUBLIC_PORT SSH_PUBLIC_PORT SSH_PORT ZC_SSH_PORT ZO_SSH_PORT ZOCOMPUTER_SSH_PORT; do
+    v="$(env_var "$var")"
+    [ -n "$v" ] && { p="$v"; break; }
+  done
+  if [ -n "${h:-}" ] && [ -n "${p:-}" ]; then
+    printf '%s %s\n' "$h" "$p"
+    return 0
+  fi
+  for var in SSH_URL SSH_COMMAND ZC_SSH_URL ZO_SSH_URL ZOCOMPUTER_SSH_URL; do
+    v="$(env_var "$var")"
+    [ -n "$v" ] || continue
+    parsed="$(python3 - "$v" <<'PY' 2>/dev/null || true
+import re, sys
+s=sys.argv[1]
+patterns=[
+    r'ssh\s+-p\s+(\d+)\s+\S+@([A-Za-z0-9._-]+)',
+    r'ssh://(?:[^@/\s]+@)?([A-Za-z0-9._-]+):(\d+)',
+    r'([A-Za-z0-9._-]+):(\d+)',
+]
+for pat in patterns:
+    m=re.search(pat, s)
+    if not m: continue
+    if pat.startswith('ssh\\s'):
+        print(m.group(2), m.group(1))
+    else:
+        print(m.group(1), m.group(2))
+    break
+PY
+)"
+    [ -n "$parsed" ] && { printf '%s\n' "$parsed"; return 0; }
+  done
+  return 1
+}
+
 detect_outbound_ip(){
   local url ip
   have curl || return 1
@@ -88,14 +192,60 @@ detect_outbound_ip(){
 }
 
 autodetect_public(){
-  PUBLIC_HOST="${PUBLIC_HOST:-$(parse_frpc_value serverAddr || true)}"
-  PUBLIC_PORT="${PUBLIC_PORT:-$(parse_frpc_value remotePort || true)}"
+  local env_ep env_host env_port frp_host frp_port frp_local
+  env_ep="$(detect_endpoint_from_env || true)"
+  if [ -n "$env_ep" ]; then
+    read -r env_host env_port <<<"$env_ep"
+    PUBLIC_HOST="${PUBLIC_HOST:-$env_host}"
+    PUBLIC_PORT="${PUBLIC_PORT:-$env_port}"
+  fi
+  frp_host="$(parse_frpc_value serverAddr || true)"
+  frp_port="$(parse_frpc_value remotePort || true)"
+  frp_local="$(parse_frpc_value localPort || true)"
+  PUBLIC_HOST="${PUBLIC_HOST:-$frp_host}"
+  PUBLIC_PORT="${PUBLIC_PORT:-$frp_port}"
   MUX_PORT="${MUX_PORT:-$(parse_frpc_value localPort || true)}"
+  MUX_PORT="${MUX_PORT:-$frp_local}"
   MUX_PORT="${MUX_PORT:-2222}"
-  [ -n "$PUBLIC_HOST" ] || PUBLIC_HOST="$(hostname -f 2>/dev/null || hostname)"
   [ -n "$PUBLIC_PORT" ] || PUBLIC_PORT="$MUX_PORT"
-  [ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(resolve_host_ip "$PUBLIC_HOST" || true)"
   [ -n "$OUTBOUND_IP" ] || OUTBOUND_IP="$(detect_outbound_ip || true)"
+  # On a normal VPS, the egress IP is often also the public ingress IP. On
+  # Modal/Zo-style web workspaces it is usually only NAT egress, so do not use it
+  # automatically there.
+  if [ -z "$PUBLIC_HOST" ] && [ -n "$OUTBOUND_IP" ] && ! modal_like_runtime; then
+    if [ "$AUTO_PUBLIC_FROM_OUTBOUND" = "on" ] || [ "$AUTO_PUBLIC_FROM_OUTBOUND" = "auto" ]; then
+      PUBLIC_HOST="$OUTBOUND_IP"
+    fi
+  fi
+  if [ -n "$PUBLIC_HOST" ] && ! host_is_probably_public "$PUBLIC_HOST"; then
+    warn "探测到的 PUBLIC_HOST=${PUBLIC_HOST} 不是可外部访问的公网名/IP，已忽略。"
+    PUBLIC_HOST=""
+    PUBLIC_IP=""
+  fi
+  [ -n "$PUBLIC_HOST" ] && [ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(resolve_host_ip "$PUBLIC_HOST" || true)"
+}
+
+require_public_endpoint(){
+  if [ -z "${PUBLIC_HOST:-}" ] || [ -z "${PUBLIC_PORT:-}" ]; then
+    cat >&2 <<EOF
+
+没有找到真实公网入口，已停止生成客户端配置，避免产生“看起来成功但外网不可用”的节点。
+
+当前容器内能打开的 ${MUX_PORT} 只是本地监听；截图里的 modal:2222 / 127.0.0.1 属于容器内部地址，不是手机可连接的公网入口。
+
+解决办法二选一：
+1. 先在平台面板开启 SSH/TCP 端口映射，再重跑脚本；
+2. 直接把平台给出的 SSH 命令拆成 PUBLIC_HOST/PUBLIC_PORT，例如：
+
+   PUBLIC_HOST=ts6.zocomputer.io PUBLIC_PORT=10946 bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
+
+如果你确认公网入口就是出口 IP，可强制：
+
+   AUTO_PUBLIC_FROM_OUTBOUND=on PUBLIC_PORT=${MUX_PORT} bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
+
+EOF
+    exit 1
+  fi
 }
 
 arch_asset(){
@@ -804,6 +954,7 @@ PY
 
 probe_public_tcp(){
   [ -n "$PUBLIC_HOST" ] && [ -n "$PUBLIC_PORT" ] || return 1
+  host_is_probably_public "$PUBLIC_HOST" || return 1
   if have timeout; then
     timeout 8 bash -c "</dev/tcp/${PUBLIC_HOST}/${PUBLIC_PORT}" >/tmp/vpnmux-public-tcp.out 2>/tmp/vpnmux-public-tcp.err
   else
@@ -837,6 +988,7 @@ wait_for_handoff(){
 deploy(){
   need_root
   autodetect_public
+  require_public_endpoint
   log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
   mkdir -p "$WORK" "$OUT"
   ensure_ssh_server
