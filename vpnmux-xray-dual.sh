@@ -18,6 +18,10 @@ OUT="${OUT:-/root/vpnmux/out}"
 CONF="${SUPERVISOR_CONF:-/etc/zo/supervisord-user.conf}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
+# PUBLIC_IP is the resolved/public entry IP for PUBLIC_HOST when detectable.
+# OUTBOUND_IP is the container/server egress IP as seen by public IP echo services.
+PUBLIC_IP="${PUBLIC_IP:-}"
+OUTBOUND_IP="${OUTBOUND_IP:-}"
 MUX_PORT="${MUX_PORT:-}"
 SSH_INNER_PORT="${SSH_INNER_PORT:-2223}"
 VMESS_PORT="${VMESS_PORT:-2224}"
@@ -49,6 +53,33 @@ parse_frpc_value(){
   return 1
 }
 
+resolve_host_ip(){
+  local host="$1" ip=""
+  [ -n "$host" ] || return 1
+  if have getent; then
+    ip=$(getent ahostsv4 "$host" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$ip" ] || ip=$(getent hosts "$host" 2>/dev/null | awk '/^[0-9.]+[[:space:]]/ {print $1; exit}')
+  fi
+  if [ -z "$ip" ] && have dig; then
+    ip=$(dig +short A "$host" 2>/dev/null | awk '/^[0-9.]+$/ {print; exit}')
+  fi
+  [ -n "$ip" ] && printf '%s\n' "$ip"
+}
+
+detect_outbound_ip(){
+  local url ip
+  have curl || return 1
+  for url in \
+    https://api.ipify.org \
+    https://ifconfig.me/ip \
+    https://icanhazip.com \
+    https://checkip.amazonaws.com; do
+    ip=$(curl -fsSL --connect-timeout 4 --max-time 8 "$url" 2>/dev/null | tr -d '[:space:]' | sed -n 's/^\([0-9][0-9.]*\)$/\1/p' | head -n1 || true)
+    [ -n "$ip" ] && { printf '%s\n' "$ip"; return 0; }
+  done
+  return 1
+}
+
 autodetect_public(){
   PUBLIC_HOST="${PUBLIC_HOST:-$(parse_frpc_value serverAddr || true)}"
   PUBLIC_PORT="${PUBLIC_PORT:-$(parse_frpc_value remotePort || true)}"
@@ -56,6 +87,8 @@ autodetect_public(){
   MUX_PORT="${MUX_PORT:-2222}"
   [ -n "$PUBLIC_HOST" ] || PUBLIC_HOST="$(hostname -f 2>/dev/null || hostname)"
   [ -n "$PUBLIC_PORT" ] || PUBLIC_PORT="$MUX_PORT"
+  [ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(resolve_host_ip "$PUBLIC_HOST" || true)"
+  [ -n "$OUTBOUND_IP" ] || OUTBOUND_IP="$(detect_outbound_ip || true)"
 }
 
 arch_asset(){
@@ -119,6 +152,8 @@ write_state(){
   cat > "$WORK/state.env" <<STATE
 PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_PORT=${PUBLIC_PORT}
+PUBLIC_IP=${PUBLIC_IP}
+OUTBOUND_IP=${OUTBOUND_IP}
 MUX_PORT=${MUX_PORT}
 SSH_INNER_PORT=${SSH_INNER_PORT}
 VMESS_PORT=${VMESS_PORT}
@@ -231,7 +266,23 @@ JSON
 }
 
 write_client_configs(){
+  cat > "$OUT/endpoint-info.txt" <<INFO
+PUBLIC_HOST=${PUBLIC_HOST}
+PUBLIC_PORT=${PUBLIC_PORT}
+PUBLIC_IP=${PUBLIC_IP:-unknown}
+OUTBOUND_IP=${OUTBOUND_IP:-unknown}
+MUX_PORT=${MUX_PORT}
+
+说明：
+- PUBLIC_HOST/PUBLIC_PORT 是客户端应连接的公网入口。
+- PUBLIC_IP 是 PUBLIC_HOST 当前解析到的 IPv4，便于排查 DNS/入口变化。
+- OUTBOUND_IP 是容器访问公网时暴露的出口 IPv4，可能与入口 IP 不同。
+INFO
   cat > "$OUT/IMPORT_THIS_CLASH_META_COMBINED.yaml" <<YAML
+# public-host: ${PUBLIC_HOST}
+# public-port: ${PUBLIC_PORT}
+# public-ip: ${PUBLIC_IP:-unknown}
+# outbound-ip: ${OUTBOUND_IP:-unknown}
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -549,7 +600,7 @@ EOS_PROCESS_HANDOFF
 deploy(){
   need_root
   autodetect_public
-  log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} MUX_PORT=${MUX_PORT}"
+  log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
   mkdir -p "$WORK" "$OUT"
   install_xray
   write_state
@@ -574,6 +625,7 @@ deploy(){
   log "开始后台切换。当前 SSH 可能短暂断开。"
   nohup bash "$handoff" >/dev/shm/vpnmux-handoff-launch.log 2>&1 &
   ok "已准备完成。客户端配置：$OUT/IMPORT_THIS_CLASH_META_COMBINED.yaml"
+  echo "入口信息    : $OUT/endpoint-info.txt"
   echo "VMess URI   : $OUT/vmess-uri.txt"
   echo "VLESS URI   : $OUT/vless-reality-uri.txt"
   echo "状态命令    : ${QUICK_CMD} status 或 bash $WORK/vpnmux-xray-dual.sh status"
