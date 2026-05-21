@@ -16,6 +16,7 @@ ACTION="${1:-deploy}"
 WORK="${WORK:-/etc/vpnmux}"
 OUT="${OUT:-/root/vpnmux/out}"
 CONF="${SUPERVISOR_CONF:-/etc/zo/supervisord-user.conf}"
+SYSTEM_SUPERVISOR_CONF="${SYSTEM_SUPERVISOR_CONF:-/etc/zo/supervisor.conf}"
 PUBLIC_HOST="${PUBLIC_HOST:-}"
 PUBLIC_PORT="${PUBLIC_PORT:-}"
 # PUBLIC_IP is the resolved/public entry IP for PUBLIC_HOST when detectable.
@@ -37,13 +38,19 @@ AUTO_PUBLIC_FROM_OUTBOUND="${AUTO_PUBLIC_FROM_OUTBOUND:-auto}"
 AUTO_NGROK_PUBLIC="${AUTO_NGROK_PUBLIC:-off}"
 AUTO_SCAN_PLATFORM_ENDPOINT="${AUTO_SCAN_PLATFORM_ENDPOINT:-on}"
 AUTO_WAIT_PUBLIC_ENDPOINT="${AUTO_WAIT_PUBLIC_ENDPOINT:-on}"
-AUTO_USE_EXISTING_NGROK="${AUTO_USE_EXISTING_NGROK:-on}"
+AUTO_USE_EXISTING_NGROK="${AUTO_USE_EXISTING_NGROK:-off}"
+AUTO_ZO_NATIVE_SSH="${AUTO_ZO_NATIVE_SSH:-on}"
 PUBLIC_ENDPOINT_WAIT_SECONDS="${PUBLIC_ENDPOINT_WAIT_SECONDS:-20}"
 ALLOW_PRIVATE_PUBLIC_HOST="${ALLOW_PRIVATE_PUBLIC_HOST:-off}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
+SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY:-}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 SSHD_EXTRA_OPTS="${SSHD_EXTRA_OPTS:--o PermitRootLogin=yes -o PasswordAuthentication=yes -o PubkeyAuthentication=yes -o UsePAM=no}"
 PUBLIC_SOURCE="${PUBLIC_SOURCE:-}"
+ZO_SSH_TUNNEL_API="${ZO_SSH_TUNNEL_API:-https://api.zo.computer/system-services/ssh-tunnel}"
+ZO_ACCESS_TOKEN="${ZO_ACCESS_TOKEN:-${ACCESS_TOKEN:-}}"
+ZO_ACCESS_COOKIE="${ZO_ACCESS_COOKIE:-${ZO_COOKIE:-}}"
+ZO_NATIVE_SSH_PORT="${ZO_NATIVE_SSH_PORT:-}"
 NGROK_BIN="${NGROK_BIN:-/usr/local/bin/ngrok}"
 NGROK_REGION="${NGROK_REGION:-}"
 NGROK_TRY_TIMEOUT="${NGROK_TRY_TIMEOUT:-35}"
@@ -128,6 +135,88 @@ modal_like_runtime(){
   return 1
 }
 
+detect_zo_native_ssh_port(){
+  [ "$AUTO_ZO_NATIVE_SSH" = "on" ] || return 1
+  local file="$SYSTEM_SUPERVISOR_CONF" port
+  [ -r "$file" ] || file="/etc/zo/supervisor.conf"
+  [ -r "$file" ] || return 1
+  port="$(awk '
+    /^\[program:ssh\]/{inssh=1; next}
+    /^\[/{inssh=0}
+    inssh && /^command=/ { print; exit }
+  ' "$file" 2>/dev/null | sed -n 's/.*[[:space:]]-p[[:space:]]\+\([0-9][0-9]*\).*/\1/p' | head -n1 || true)"
+  if [ -z "$port" ]; then
+    port="$(grep -E 'sshd .* -p [0-9]+' "$file" 2>/dev/null | sed -n 's/.* -p \([0-9][0-9]*\).*/\1/p' | head -n1)"
+  fi
+  [ -n "$port" ] && printf '%s\n' "$port"
+}
+
+ensure_zo_authorized_key(){
+  [ -n "$SSH_PUBLIC_KEY" ] || return 0
+  [ "$AUTO_ZO_NATIVE_SSH" = "on" ] || return 0
+  local dir="/__substrate/.ssh" file="/__substrate/.ssh/authorized_keys" key
+  key="$(printf '%s' "$SSH_PUBLIC_KEY" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+  [ -n "$key" ] || return 0
+  mkdir -p "$dir"
+  chmod 700 "$dir" 2>/dev/null || true
+  touch "$file"
+  chmod 600 "$file" 2>/dev/null || true
+  if ! grep -Fxq "$key" "$file" 2>/dev/null; then
+    printf '%s\n' "$key" >> "$file"
+    ok "已写入 Zo 原生 SSH authorized_keys：$file"
+  fi
+}
+
+detect_zo_ssh_tunnel_api(){
+  [ "$AUTO_ZO_NATIVE_SSH" = "on" ] || return 1
+  have curl || return 1
+  [ -n "$ZO_ACCESS_TOKEN" ] || [ -n "$ZO_ACCESS_COOKIE" ] || return 1
+  local tmp code host port tcp_addr status
+  tmp="$(mktemp)"
+  if [ -n "$ZO_ACCESS_TOKEN" ]; then
+    code="$(curl -sS -L --connect-timeout 5 --max-time 15 -o "$tmp" -w '%{http_code}' \
+      -H "Authorization: Bearer ${ZO_ACCESS_TOKEN}" "$ZO_SSH_TUNNEL_API" 2>/dev/null || true)"
+  else
+    code="$(curl -sS -L --connect-timeout 5 --max-time 15 -o "$tmp" -w '%{http_code}' \
+      -H "Cookie: ${ZO_ACCESS_COOKIE}" "$ZO_SSH_TUNNEL_API" 2>/dev/null || true)"
+  fi
+  if [ "$code" = "401" ] || [ "$code" = "403" ]; then
+    warn "Zo SSH tunnel API 返回 ${code}：容器内 ZO_CLIENT_IDENTITY_TOKEN/ZO_HOST_SERVICE_JWT 不能代替网页登录 access_token；如需脚本自动查询公网 SSH 入口，请传入 ZO_ACCESS_TOKEN 或 ZO_ACCESS_COOKIE。"
+    rm -f "$tmp"
+    return 1
+  fi
+  [ "$code" = "200" ] || { rm -f "$tmp"; return 1; }
+  read -r host port tcp_addr status < <(python3 - "$tmp" <<'PY' 2>/dev/null || true
+import json, re, sys
+try:
+    data=json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+tcp=str(data.get("tcp_addr") or data.get("ssh_addr") or data.get("addr") or "")
+host=str(data.get("host") or data.get("hostname") or "")
+port=str(data.get("port") or data.get("public_port") or "")
+cmd=str(data.get("ssh_command") or data.get("command") or "")
+text="\n".join([tcp, cmd])
+if (not host or not port) and text:
+    m=re.search(r'(?:ssh://(?:[^@/\s]+@)?|ssh\b[^\n\r;]*?-p\s+([0-9]{2,5})[^\n\r;]*?\b(?:[A-Za-z0-9_.-]+@)?|^)([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+):?([0-9]{2,5})?', text)
+    if m:
+        if m.group(1) and m.group(2):
+            port=m.group(1); host=m.group(2)
+        else:
+            host=m.group(2) or host; port=m.group(3) or port
+if ":" in tcp and (not host or not port):
+    h,p=tcp.rsplit(":",1)
+    if p.isdigit():
+        host=host or h; port=port or p
+print(host, port, tcp, str(data.get("status") or ""))
+PY
+)
+  rm -f "$tmp"
+  [ -n "$host" ] && [ -n "$port" ] && host_is_probably_public "$host" || return 1
+  ZO_NATIVE_SSH_PORT="${ZO_NATIVE_SSH_PORT:-$(detect_zo_native_ssh_port || true)}"
+  printf '%s\t%s\t%s\tzo-ssh-tunnel-api:%s\n' "$host" "$port" "${ZO_NATIVE_SSH_PORT:-2288}" "${status:-unknown}"
+}
+
 host_is_probably_public(){
   local host="$1" lower ip
   [ "$ALLOW_PRIVATE_PUBLIC_HOST" = "on" ] && [ -n "$host" ] && return 0
@@ -153,6 +242,24 @@ host_is_probably_public(){
   return 0
 }
 
+host_is_ngrok(){
+  local host="${1,,}"
+  case "$host" in
+    *ngrok.io|*.ngrok.io|*.tcp.ngrok.io|*.ngrok-free.app|*ngrok-free.app) return 0 ;;
+    *ngrok*) return 0 ;;
+  esac
+  return 1
+}
+
+endpoint_allowed_by_policy(){
+  local host="$1" src="${2:-}"
+  host_is_probably_public "$host" || return 1
+  if host_is_ngrok "$host" || [[ "${src,,}" == *ngrok* ]]; then
+    [ "$AUTO_USE_EXISTING_NGROK" = "on" ] || return 1
+  fi
+  return 0
+}
+
 env_var(){
   local name="$1"
   eval 'printf "%s\n" "${'"$name"':-}"'
@@ -174,8 +281,10 @@ patterns=[
     (r'ssh://(?:[^@/\s]+@)?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+):([0-9]{2,5})', 'host_port'),
     # PUBLIC_HOST=... PUBLIC_PORT=...
     (r'(?:PUBLIC_HOST|SSH_PUBLIC_HOST|SSH_HOST|ZC_SSH_HOST|ZO_SSH_HOST|ZOCOMPUTER_SSH_HOST)\s*[:=]\s*["\']?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)["\']?[\s\S]{0,300}?(?:PUBLIC_PORT|SSH_PUBLIC_PORT|SSH_PORT|ZC_SSH_PORT|ZO_SSH_PORT|ZOCOMPUTER_SSH_PORT)\s*[:=]\s*["\']?([0-9]{2,5})', 'host_port'),
-    # generic public host:port, useful for small platform status files
-    (r'\b([A-Za-z0-9_.-]+\.(?:zocomputer\.io|zo[a-z0-9.-]*|ngrok-free\.app|ngrok\.io|tcp\.ngrok\.io|[A-Za-z]{2,}))\s*:\s*([0-9]{2,5})\b', 'host_port'),
+    # known platform/tunnel host:port in small status files. Keep this
+    # intentionally narrow; broad "anything.tld:number" patterns misread
+    # stack traces such as main.go:146 as public endpoints.
+    (r'\b([A-Za-z0-9_.-]+\.(?:zocomputer\.io|zo(?:computer)?\.[A-Za-z0-9.-]+|ngrok-free\.app|ngrok\.io|tcp\.ngrok\.io))\s*:\s*([0-9]{2,5})\b', 'host_port'),
 ]
 for pat, order in patterns:
     m=re.search(pat, text, flags=re.I)
@@ -228,7 +337,7 @@ detect_endpoint_from_files(){
     parsed="$(head -c 2000000 "$file" 2>/dev/null | parse_endpoint_text 2>/dev/null || true)"
     [ -n "$parsed" ] || continue
     read -r host port local <<<"$parsed"
-    if [ -n "$host" ] && [ -n "$port" ] && host_is_probably_public "$host"; then
+    if [ -n "$host" ] && [ -n "$port" ] && endpoint_allowed_by_policy "$host" "$file"; then
       printf '%s\t%s\t%s\t%s\n' "$host" "$port" "${local:--}" "$file"
       return 0
     fi
@@ -241,7 +350,7 @@ detect_endpoint_from_processes(){
   parsed="$(ps -eo args= 2>/dev/null | grep -Ei 'frpc|ssh|zcomputer|zo[^[:alnum:]]|modal|tunnel' | parse_endpoint_text 2>/dev/null || true)"
   [ -n "$parsed" ] || return 1
   read -r host port local <<<"$parsed"
-  if [ -n "$host" ] && [ -n "$port" ] && host_is_probably_public "$host"; then
+  if [ -n "$host" ] && [ -n "$port" ] && endpoint_allowed_by_policy "$host" "process"; then
     printf '%s\t%s\t%s\tprocess\n' "$host" "$port" "${local:--}"
     return 0
   fi
@@ -391,7 +500,7 @@ detect_outbound_ip(){
 }
 
 autodetect_public(){
-  local env_ep env_host env_port frp_host frp_port frp_local ng_ep ng_host ng_port ng_local ng_src file_ep file_host file_port file_local file_src proc_ep proc_host proc_port proc_local proc_src
+  local env_ep env_host env_port frp_host frp_port frp_local zo_ep zo_host zo_port zo_local zo_src ng_ep ng_host ng_port ng_local ng_src file_ep file_host file_port file_local file_src proc_ep proc_host proc_port proc_local proc_src
   env_ep="$(detect_endpoint_from_env || true)"
   if [ -n "$env_ep" ]; then
     read -r env_host env_port <<<"$env_ep"
@@ -407,6 +516,14 @@ autodetect_public(){
   MUX_PORT="${MUX_PORT:-$(parse_frpc_value localPort || true)}"
   MUX_PORT="${MUX_PORT:-$frp_local}"
   if [ -n "$frp_host" ] && [ -n "$frp_port" ] && [ -z "${PUBLIC_SOURCE:-}" ]; then PUBLIC_SOURCE="frpc"; fi
+  zo_ep="$(detect_zo_ssh_tunnel_api || true)"
+  if [ -n "$zo_ep" ]; then
+    IFS=$'\t' read -r zo_host zo_port zo_local zo_src <<<"$zo_ep"
+    PUBLIC_HOST="${PUBLIC_HOST:-$zo_host}"
+    PUBLIC_PORT="${PUBLIC_PORT:-$zo_port}"
+    MUX_PORT="${MUX_PORT:-$zo_local}"
+    [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="$zo_src"
+  fi
   ng_ep="$(detect_existing_ngrok_endpoint || true)"
   if [ -n "$ng_ep" ]; then
     IFS=$'\t' read -r ng_host ng_port ng_local ng_src <<<"$ng_ep"
@@ -432,6 +549,11 @@ autodetect_public(){
     PUBLIC_PORT="${PUBLIC_PORT:-$proc_port}"
     MUX_PORT="${MUX_PORT:-$proc_local}"
     [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="$proc_src"
+  fi
+  if [ -z "${MUX_PORT:-}" ] && modal_like_runtime; then
+    ZO_NATIVE_SSH_PORT="${ZO_NATIVE_SSH_PORT:-$(detect_zo_native_ssh_port || true)}"
+    MUX_PORT="${ZO_NATIVE_SSH_PORT:-}"
+    [ -n "$MUX_PORT" ] && [ -z "${PUBLIC_SOURCE:-}" ] && PUBLIC_SOURCE="${PUBLIC_SOURCE:-zo-native-ssh-local}"
   fi
   MUX_PORT="${MUX_PORT:-2222}"
   [ -n "$PUBLIC_PORT" ] || PUBLIC_PORT="$MUX_PORT"
@@ -464,11 +586,13 @@ require_public_endpoint(){
 脚本已经尝试自动补齐容器内 SSH，并扫描平台状态/日志中的公网入口。当前默认不启用 ngrok；如果你手动设置 AUTO_NGROK_PUBLIC=on，脚本也会尝试用 ngrok TCP 自动构造公网入口。走到这里通常表示：
 - 平台没有原生 SSH/TCP 映射；
 - 或者平台已经给了映射，但没有把 SSH 命令/FRP 配置写到容器内可读位置；
-- 若你打开了 ngrok，则可能是 token 池为空、失效、额度满，或当前网络无法连接 ngrok。
+- Zo/Zcomputer 这类容器的公网 SSH 地址通常来自平台网页登录态接口 /system-services/ssh-tunnel；容器内的 ZO_CLIENT_IDENTITY_TOKEN / ZO_HOST_SERVICE_JWT 不能代替网页登录 access_token。
+- 若你手动打开了 ngrok 兜底，则可能是 token 池为空、失效、额度满，或当前网络无法连接 ngrok。
 
 解决办法：
 1. 先在平台面板开启 SSH/TCP 端口映射，再重跑脚本；
-2. 直接把平台给出的 SSH 命令拆成 PUBLIC_HOST/PUBLIC_PORT，例如：
+2. 若有网页登录 access token/cookie，可传入 ZO_ACCESS_TOKEN 或 ZO_ACCESS_COOKIE 让脚本查询 Zo 原生 SSH tunnel API；
+3. 直接把平台给出的 SSH 命令拆成 PUBLIC_HOST/PUBLIC_PORT，例如：
 
    PUBLIC_HOST=ts6.zocomputer.io PUBLIC_PORT=10946 bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
 
@@ -637,7 +761,7 @@ wait_for_platform_public_endpoint(){
     fi
     now="$(date +%s)"
     if [ $(( (deadline - now) % 6 )) -eq 0 ] 2>/dev/null; then
-      log "还在等待公网入口写入；已检查环境变量、ngrok 状态、平台配置/日志。"
+      log "还在等待公网入口写入；已检查环境变量、Zo/FRP/平台配置与日志。ngrok 仅在 AUTO_USE_EXISTING_NGROK=on 时作为已有入口参与探测。"
     fi
     sleep 2
   done
@@ -714,6 +838,7 @@ ensure_ssh_server(){
   fi
   configure_sshd_auth
   set_root_password_if_requested
+  ensure_zo_authorized_key
   if ! "$SSHD_BIN" -t $SSHD_EXTRA_OPTS >/tmp/vpnmux-sshd-test.out 2>/tmp/vpnmux-sshd-test.err; then
     warn "sshd 配置自检未通过，稍后仍会尝试用命令行参数启动；详情：/tmp/vpnmux-sshd-test.err"
   fi
@@ -827,6 +952,7 @@ write_state(){
   local detected_ngrok_url="$NGROK_URL" detected_ngrok_token="$NGROK_TOKEN_FINGERPRINT"
   local detected_mux_port="$MUX_PORT" detected_ssh_inner_port="$SSH_INNER_PORT" detected_vmess_port="$VMESS_PORT" detected_reality_port="$REALITY_PORT"
   local detected_sshd_bin="$SSHD_BIN" detected_sshd_opts="$SSHD_EXTRA_OPTS"
+  local detected_zo_native_ssh_port="${ZO_NATIVE_SSH_PORT:-$(detect_zo_native_ssh_port || true)}"
   mkdir -p "$WORK" "$OUT" "$WORK/bootstrap"
   chmod 700 "$WORK" "$WORK/bootstrap" 2>/dev/null || true
   if [ -f "$WORK/state.env" ]; then . "$WORK/state.env" || true; fi
@@ -843,6 +969,7 @@ write_state(){
   REALITY_PORT="$detected_reality_port"
   SSHD_BIN="$detected_sshd_bin"
   SSHD_EXTRA_OPTS="$detected_sshd_opts"
+  ZO_NATIVE_SSH_PORT="$detected_zo_native_ssh_port"
   UUID="${UUID:-$(rand_uuid)}"
   WS_PATH="${WS_PATH:-/$(openssl rand -hex 12)-vmess}"
   REALITY_UUID="${REALITY_UUID:-$(rand_uuid)}"
@@ -860,6 +987,7 @@ PUBLIC_SOURCE=${PUBLIC_SOURCE}
 NGROK_URL=${NGROK_URL}
 NGROK_TOKEN_FINGERPRINT=${NGROK_TOKEN_FINGERPRINT}
 MUX_PORT=${MUX_PORT}
+ZO_NATIVE_SSH_PORT=${ZO_NATIVE_SSH_PORT}
 SSH_INNER_PORT=${SSH_INNER_PORT}
 VMESS_PORT=${VMESS_PORT}
 XRAY_PORT=${VMESS_PORT}
@@ -988,6 +1116,7 @@ MUX_PORT=${MUX_PORT}
 - PUBLIC_IP 是 PUBLIC_HOST 当前解析到的 IPv4，便于排查 DNS/入口变化。
 - OUTBOUND_IP 是容器访问公网时暴露的出口 IPv4，可能与入口 IP 不同。
 - PUBLIC_SOURCE=ngrok-tcp 表示脚本没有找到平台原生公网入口，已自动用 ngrok TCP 构造入口。
+- PUBLIC_SOURCE=zo-ssh-tunnel-api:* 表示入口来自 Zo/Zcomputer 登录态 API /system-services/ssh-tunnel，通常外部映射到容器内 2288。
 INFO
   cat > "$OUT/IMPORT_THIS_CLASH_META_COMBINED.yaml" <<YAML
 # public-host: ${PUBLIC_HOST}
@@ -1067,7 +1196,9 @@ write_restore(){
 set +e
 WORK=/etc/vpnmux
 CONF=${SUPERVISOR_CONF:-/etc/zo/supervisord-user.conf}
+SYSTEM_SUPERVISOR_CONF=${SYSTEM_SUPERVISOR_CONF:-/etc/zo/supervisor.conf}
 SUP="supervisorctl -c $CONF"
+SYS_SUP="supervisorctl -c $SYSTEM_SUPERVISOR_CONF"
 [ -f "$WORK/state.env" ] && . "$WORK/state.env"
 MUX_PORT="${MUX_PORT:-2222}"
 SSH_INNER_PORT="${SSH_INNER_PORT:-2223}"
@@ -1088,6 +1219,7 @@ if [ -f "$WORK/supervisord-user.conf.orig" ]; then cp -f "$WORK/supervisord-user
 $SUP reread || true
 $SUP update || true
 $SUP start ssh || true
+[ -f "$SYSTEM_SUPERVISOR_CONF" ] && $SYS_SUP start ssh || true
 sleep 1
 mkdir -p /run/sshd /var/run/sshd
 if ! timeout 2 bash -c "</dev/tcp/127.0.0.1/${MUX_PORT}" >/dev/null 2>&1; then
@@ -1244,11 +1376,21 @@ write_handoff(){
 set +e
 WORK=/etc/vpnmux
 CONF=${SUPERVISOR_CONF:-/etc/zo/supervisord-user.conf}
+SYSTEM_SUPERVISOR_CONF=${SYSTEM_SUPERVISOR_CONF:-/etc/zo/supervisor.conf}
 SUP="supervisorctl -c $CONF"
+SYS_SUP="supervisorctl -c $SYSTEM_SUPERVISOR_CONF"
 . "$WORK/state.env"
 LOG=/dev/shm/vpnmux-handoff.log
 exec >>"$LOG" 2>&1
 echo "[$(date -Is)] handoff start"
+system_ssh_port(){
+  [ -r "$SYSTEM_SUPERVISOR_CONF" ] || return 1
+  awk '
+    /^\[program:ssh\]/{inssh=1; next}
+    /^\[/{inssh=0}
+    inssh && /^command=/ { print; exit }
+  ' "$SYSTEM_SUPERVISOR_CONF" 2>/dev/null | sed -n 's/.*[[:space:]]-p[[:space:]]\+\([0-9][0-9]*\).*/\1/p' | head -n1
+}
 listener_pids(){
   local port="$1"
   if command -v ss >/dev/null 2>&1; then
@@ -1260,6 +1402,11 @@ listener_pids(){
 $SUP reread
 $SUP stop vpnmux-mux || true
 $SUP stop ssh || true
+SYS_SSH_PORT="$(system_ssh_port || true)"
+if [ -n "$SYS_SSH_PORT" ] && [ "$SYS_SSH_PORT" = "$MUX_PORT" ]; then
+  echo "[$(date -Is)] stopping system supervisor ssh on mux port $MUX_PORT"
+  [ -f "$SYSTEM_SUPERVISOR_CONF" ] && $SYS_SUP stop ssh || true
+fi
 for pid in $(listener_pids "$MUX_PORT"); do
   echo "[$(date -Is)] stopping old listener pid=$pid port=$MUX_PORT"
   kill "$pid" 2>/dev/null || true
@@ -1300,11 +1447,21 @@ write_process_handoff(){
 set +e
 WORK=/etc/vpnmux
 . "$WORK/state.env"
+SYSTEM_SUPERVISOR_CONF=${SYSTEM_SUPERVISOR_CONF:-/etc/zo/supervisor.conf}
+SYS_SUP="supervisorctl -c $SYSTEM_SUPERVISOR_CONF"
 RUN="$WORK/run"
 mkdir -p "$RUN" /run/sshd /var/run/sshd
 LOG=/dev/shm/vpnmux-process-handoff.log
 exec >>"$LOG" 2>&1
 echo "[$(date -Is)] process handoff start"
+system_ssh_port(){
+  [ -r "$SYSTEM_SUPERVISOR_CONF" ] || return 1
+  awk '
+    /^\[program:ssh\]/{inssh=1; next}
+    /^\[/{inssh=0}
+    inssh && /^command=/ { print; exit }
+  ' "$SYSTEM_SUPERVISOR_CONF" 2>/dev/null | sed -n 's/.*[[:space:]]-p[[:space:]]\+\([0-9][0-9]*\).*/\1/p' | head -n1
+}
 stop_pid(){ [ -s "$1" ] && kill "$(cat "$1")" 2>/dev/null || true; rm -f "$1"; }
 listener_pids(){
   local port="$1"
@@ -1323,6 +1480,11 @@ start_one sshd-inner "\"$SSHD_BIN\" -D -e $SSHD_EXTRA_OPTS -o ListenAddress=127.
 start_one xray-vmess "xray run -config $WORK/xray-vmess-server.json" /dev/shm/vpnmux-xray-vmess.log
 start_one xray-reality "xray run -config $WORK/xray-reality-server.json" /dev/shm/vpnmux-xray-reality.log
 sleep 3
+SYS_SSH_PORT="$(system_ssh_port || true)"
+if [ -n "$SYS_SSH_PORT" ] && [ "$SYS_SSH_PORT" = "$MUX_PORT" ]; then
+  echo "[$(date -Is)] stopping system supervisor ssh on mux port $MUX_PORT"
+  [ -f "$SYSTEM_SUPERVISOR_CONF" ] && $SYS_SUP stop ssh || true
+fi
 for pid in $(listener_pids "$MUX_PORT"); do
   echo "[$(date -Is)] stopping old listener pid=$pid port=$MUX_PORT"
   kill "$pid" 2>/dev/null || true
@@ -1399,15 +1561,21 @@ wait_for_handoff(){
 
 deploy(){
   need_root
+  log "[1/9] 探测公网入口与平台 SSH 端口"
   autodetect_public
   mkdir -p "$WORK" "$OUT"
+  log "[2/9] 补齐 SSH 服务端前置条件"
   ensure_ssh_server
+  log "[3/9] 确认本地复用入口端口 ${MUX_PORT}"
   ensure_mux_ssh_entry
+  log "[4/9] 等待平台写入/返回公网 SSH 入口"
   wait_for_platform_public_endpoint || true
   ensure_public_endpoint_or_tunnel || true
   require_public_endpoint
   log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} SOURCE=${PUBLIC_SOURCE:-detected} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
+  log "[5/9] 安装/确认 Xray"
   install_xray
+  log "[6/9] 写入 VPNMux / Xray / 客户端配置"
   write_state
   write_mux
   write_xray_configs
@@ -1416,7 +1584,9 @@ deploy(){
   cp -f "$0" "$WORK/vpnmux-xray-dual.sh" 2>/dev/null || true
   chmod 755 "$WORK/vpnmux-xray-dual.sh" 2>/dev/null || true
   write_quick_cmd
+  log "[7/9] 本地预检分流与 REALITY 出口"
   pretest
+  log "[8/9] 配置后台守护"
   if supervisor_usable; then
     patch_supervisor
     write_handoff
@@ -1427,6 +1597,7 @@ deploy(){
     write_process_handoff
     handoff="$WORK/bootstrap/process-handoff.sh"
   fi
+  log "[9/9] 切换入口到 VPNMux"
   log "开始后台切换。当前 SSH 可能短暂断开。"
   nohup bash "$handoff" >/dev/shm/vpnmux-handoff-launch.log 2>&1 &
   wait_for_handoff
@@ -1444,6 +1615,7 @@ status(){
   [ -f "$WORK/state.env" ] && awk -F= '$1 !~ /PRIVATE|SSHD_EXTRA_OPTS/ {print}' "$WORK/state.env" || true
   echo "--- supervisor ---"
   if have supervisorctl && [ -f "$CONF" ]; then supervisorctl -c "$CONF" status | grep -E 'ssh|vpnmux' || true; fi
+  if have supervisorctl && [ -f "$SYSTEM_SUPERVISOR_CONF" ]; then supervisorctl -c "$SYSTEM_SUPERVISOR_CONF" status | grep -E '^ssh[[:space:]]' || true; fi
   echo "--- process pid files ---"
   find "$WORK/run" -maxdepth 1 -type f -name '*.pid' -print -exec cat {} \; 2>/dev/null || true
   echo "--- ngrok ---"

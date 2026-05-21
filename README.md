@@ -24,8 +24,9 @@ bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vp
 - SSH 前置条件：缺少 `sshd` 时自动安装 OpenSSH Server，自动生成 host key，创建 `/run/sshd`，必要时先在 `MUX_PORT` 拉起临时 SSH 占位，再切换成 VPNMux。
 - 部署末尾会等待后台切换并做本地 SSH/VMess-WS 验证；若公网入口从容器内无法回连，会给出提示但不直接判死刑。
 - 不再把 `modal`、`localhost`、`127.0.0.1`、内网 IP 或无点短主机名误当公网入口；如果平台没有开启 SSH/TCP 映射，会停止生成客户端配置并提示手动传入 `PUBLIC_HOST` / `PUBLIC_PORT`。
-- 默认不主动新建 ngrok 兜底；脚本会先打开容器内 SSH，再等待并扫描环境变量、已运行的 ngrok SSH、本地 ngrok API、进程、`/__substrate`、`/etc/zo`、`/run`、`/tmp`、`/var/log` 等平台状态/日志里的 SSH 命令、`frpc` 配置和公网入口。需要主动新建 ngrok 兜底时手动加 `AUTO_NGROK_PUBLIC=on`。
-- 如果已经先运行过 `ngrok-ssh-pool.sh`，脚本会自动识别 `tcp://host:port -> localhost:本地端口`，并把 `MUX_PORT` 改成 ngrok 正在转发的本地端口，让公网 ngrok 入口直接进入 VPNMux。
+- 默认不主动新建 ngrok 兜底，也不会自动使用已有 ngrok；脚本会先打开容器内 SSH，再等待并扫描环境变量、Zo/FRP 配置、进程、`/__substrate`、`/etc/zo`、`/run`、`/tmp`、`/var/log` 等平台状态/日志里的 SSH 命令、`frpc` 配置和公网入口。需要使用已有 ngrok 时手动加 `AUTO_USE_EXISTING_NGROK=on`，需要主动新建 ngrok 兜底时手动加 `AUTO_NGROK_PUBLIC=on`。
+- Zo/Zcomputer 原生 SSH 的容器内端口通常是 `2288`，配置在 `/etc/zo/supervisor.conf` 的 `[program:ssh]`，`AuthorizedKeysFile=/__substrate/.ssh/authorized_keys` 且默认 key-only。公网地址来自平台登录态接口 `GET https://api.zo.computer/system-services/ssh-tunnel`，返回 `tcp_addr`；容器内的 `ZO_CLIENT_IDENTITY_TOKEN` / `ZO_HOST_SERVICE_JWT` 不能代替网页登录 access token。若要让脚本自动查询该入口，需传入 `ZO_ACCESS_TOKEN` 或 `ZO_ACCESS_COOKIE`。
+- 如果已经先运行过 `ngrok-ssh-pool.sh`，只有显式设置 `AUTO_USE_EXISTING_NGROK=on` 时脚本才会识别 `tcp://host:port -> localhost:本地端口`，并把 `MUX_PORT` 改成 ngrok 正在转发的本地端口，让公网 ngrok 入口直接进入 VPNMux。
 
 如新容器没有 root 密码，但需要复用端口继续保留 SSH 登录能力，可显式传入：
 
@@ -69,6 +70,7 @@ bash /etc/vpnmux/restore-ssh.sh
 - 对 `dumb-init`、`supervisord`、普通容器环境优先降级到 process/nohup 守护。
 - VPNMux 脚本不绑定 Zcomputer，支持自动捕获公网入口/解析 IP/出口 IP，也支持通过 `PUBLIC_HOST` / `PUBLIC_PORT` / `MUX_PORT` 显式指定入口。
 - VPNMux 会自动补齐 SSH 服务端前置条件；如果平台没有真正给容器做公网端口映射，脚本只能打开容器内监听并在状态页提示公网 TCP 检测失败，不能凭空创建平台外层 NAT/FRP 映射。
+- 对 Zo/Zcomputer，脚本会优先识别原生 SSH 本地端口 `2288`。若拿到了平台 `tcp_addr`，会使用该公网入口并接管 `2288` 做 VPNMux；切换时会停止系统 supervisor 里的原生 `ssh`，恢复脚本会把它再拉起。
 - 当平台外层映射不可控时，可手动打开 `AUTO_NGROK_PUBLIC=on` 使用 ngrok TCP 作为兜底公网入口；这属于用户态反向隧道，不依赖容器具备公网入站权限，但速度/稳定性取决于 ngrok 免费线路和 token 额度。
 - Zo/Modal 这类 Web Terminal 环境里，容器 hostname 可能是 `modal` 且解析到 `127.0.0.1`；这只是容器内部地址，不能写进客户端配置。必须先开启平台 SSH/TCP 入口，或把平台显示的 `ssh -p 端口 user@host` 拆成 `PUBLIC_HOST=host PUBLIC_PORT=端口` 后部署。
 - 重新部署会保留 UUID / WS 路径 / REALITY 密钥，但不会让旧 `state.env` 里的过期公网入口覆盖本次新探测结果。
