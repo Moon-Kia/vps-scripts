@@ -39,5 +39,5 @@ vps-scripts
 推送后 README 里的 raw URL 会指向：
 
 ```text
-https://raw.githubusercontent.com/g8562006/vps-scripts/main/vpnmux-xray-dual.sh
+https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh
 ```

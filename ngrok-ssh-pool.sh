@@ -6,7 +6,7 @@ set -Eeuo pipefail
 # 用途：给没有公网入站/SFTP 的容器临时开 SSH 入口
 # ============================================================
 
-SSH_PASSWORD="${SSH_PASSWORD:-fenghuixianyu}"                         # 留空运行时输入 root 密码
+SSH_PASSWORD="${SSH_PASSWORD:-}"                         # 留空运行时输入 root 密码
 SSH_PORT=22                              # 本机 SSH 端口
 QUICK_CMD="ng"                         # 快捷命令
 INSTALL_DIR="/usr/local/lib/ngrok-ssh"
@@ -23,14 +23,7 @@ NGROK_REGION=""
 NGROK_TRY_TIMEOUT=30
 SCRIPT_VERSION="2026.05.07-ngs-r4"
 
-NGROK_AUTHTOKEN_POOL=$(cat <<'NGROK_TOKEN_EOF'
-3CGea3qbUHXnxHZdYf7aeAcnbHc_4pAHEVemwHZ4riduxnpJi
-3DLvfv8nLTh8GCX13pLbzboR3c3_4NpUBJCUheLbCEp2C5XsD
-3CGLyR0EJI05vcBygM0ZvafYNnT_6UKv77CnrBf7uFAHizNCH
-3DLw53znHbd4DEKeIJLh0VE8GjN_54znjHbde8Cb9A9Rykfbe
-3CF6PfToh18d7bp6xx3RQs2AFHY_2dhHS4usLx2VKC5C6yz2z
-NGROK_TOKEN_EOF
-)
+NGROK_AUTHTOKEN_POOL="${NGROK_AUTHTOKEN_POOL:-}"
 GREEN="\033[32m"; YELLOW="\033[33m"; RED="\033[31m"; BLUE="\033[34m"; RESET="\033[0m"
 ok(){ echo -e "${GREEN}✔ $*${RESET}"; }
 warn(){ echo -e "${YELLOW}⚠ $*${RESET}"; }

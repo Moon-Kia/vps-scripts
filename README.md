@@ -13,14 +13,14 @@
 一键安装：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/g8562006/vps-scripts/main/vpnmux-xray-dual.sh) deploy
+bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
 ```
 
 如果自动识别公网入口失败，手动指定：
 
 ```bash
 PUBLIC_HOST=你的公网域名 PUBLIC_PORT=你的公网端口 \
-  bash <(curl -fsSL https://raw.githubusercontent.com/g8562006/vps-scripts/main/vpnmux-xray-dual.sh) deploy
+  bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
 ```
 
 状态：
