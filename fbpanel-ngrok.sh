@@ -11,8 +11,8 @@ set -Eeuo pipefail
 MAIN_DOMAIN="214114.xyz"                 # cert 固定隧道主域名
 SERVER_ALIAS=""                          # 留空运行时询问；固定隧道域名 fb-别名.主域名
 HOST_PREFIX="fb"                         # 固定隧道 hostname/tunnel 前缀
-FB_USER="${FB_USER:-admin}"                  # FileBrowser 用户名
-FB_PASS="${FB_PASS:-}"                  # FileBrowser 密码；少于 12 位会提示重新输入
+FB_USER="fenghuixianyu"                  # FileBrowser 用户名
+FB_PASS="fenghuixianyu"                  # FileBrowser 密码；少于 12 位会提示重新输入
 FB_PORT=8888                              # FileBrowser 本地端口；0=随机
 FB_ADDR="127.0.0.1"                      # 建议本地监听；公网直连才改 0.0.0.0
 FB_ROOT="/"                              # FileBrowser 根目录
@@ -26,7 +26,7 @@ CHECK_CF_EDGE_ON_START="first"           # first=首次启动自动测 CF 7844�
 CF_EDGE_PRECHECK_CACHE_SECONDS=86400      # cached 模式缓存秒数
 DIRECT_PUBLIC_HOST=""                    # 公网直连地址；留空自动探测 IPv4
 ENABLE_UPTIMEROBOT_PROBE="on"            # on=用 UptimeRobot 从外部探测 公网IP:端口
-UPTIMEROBOT_API_KEY="${UPTIMEROBOT_API_KEY:-}" # Main API key；可留空改用文件/环境变量
+UPTIMEROBOT_API_KEY="u3484423-1ee45dc8f4ec2419682a475f" # Main API key；可留空改用文件/环境变量
 UPTIMEROBOT_API_KEY_FILE="/etc/fbpanel/uptimerobot_api_key.txt"
 UPTIMEROBOT_PROBE_WAIT_SECONDS=120
 UPTIMEROBOT_PROBE_INTERVAL=300
@@ -48,7 +48,14 @@ CF_EDGE_PROTOCOL="auto"                  # auto/quic/http2
 QUICK_TUNNEL_TIMEOUT=45
 
 # ngrok 兜底：一行一个 authtoken；脚本会自动轮询
-NGROK_AUTHTOKEN_POOL="${NGROK_AUTHTOKEN_POOL:-}"
+NGROK_AUTHTOKEN_POOL=$(cat <<'NGROK_TOKEN_EOF'
+3CGea3qbUHXnxHZdYf7aeAcnbHc_4pAHEVemwHZ4riduxnpJi
+3DLvfv8nLTh8GCX13pLbzboR3c3_4NpUBJCUheLbCEp2C5XsD
+3CGLyR0EJI05vcBygM0ZvafYNnT_6UKv77CnrBf7uFAHizNCH
+3DLw53znHbd4DEKeIJLh0VE8GjN_54znjHbde8Cb9A9Rykfbe
+3CF6PfToh18d7bp6xx3RQs2AFHY_2dhHS4usLx2VKC5C6yz2z
+NGROK_TOKEN_EOF
+)
 NGROK_REGION=""                          # 留空自动；可填 us/eu/ap/jp 等
 NGROK_TRY_TIMEOUT=30
 # ------------------------------------------------------------
@@ -116,7 +123,8 @@ service_recent_log(){
 }
 
 detect_service_backend(){
-  # Do not trust systemctl binary alone in containers; PID1 may be dumb-init/supervisord.
+  # Containers may ship systemctl/unit files while PID1 is not systemd.
+  # Use systemd only when the system bus is actually available.
   if command -v systemctl >/dev/null 2>&1     && [ -d /run/systemd/system ]     && systemctl is-system-running >/dev/null 2>&1; then
     SERVICE_BACKEND="systemd"
   else

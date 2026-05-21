@@ -41,3 +41,8 @@ vps-scripts
 ```text
 https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh
 ```
+
+
+## 2026-05-21 更新
+
+按要求，已从 fenghuixianyu 备份脚本恢复内置 ngrok / UptimeRobot / FileBrowser / SSH 默认值，并重新应用容器 systemd 误判修补。未在本文记录任何密钥明文。

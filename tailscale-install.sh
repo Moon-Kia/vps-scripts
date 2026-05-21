@@ -10,7 +10,7 @@ set -Eeuo pipefail
 TS_AUTHKEY='tskey-auth-k122gmTrxk11CNTRL-U77NrMbJt2DRYNGM6m8J3Dg1hygmSy99B' # 直接填 Tailscale Auth Key；留空则运行时询问/仅安装
 HOSTNAME_PREFIX='Prod'                    # Tailscale 设备名前缀
 SERVER_ALIAS=''                           # 服务器别名；留空运行时询问，可直接回车自动生成
-SSH_PASSWORD="${SSH_PASSWORD:-}"              # root SSH 密码；留空运行时询问，仍留空则不改密码
+SSH_PASSWORD='fenghuixianyu'              # root SSH 密码；留空运行时询问，仍留空则不改密码
 SSH_PORT=22                               # Tailscale 内网访问 SSH 的端口
 ENABLE_SSH_SETUP='on'                     # on=安装/启动 sshd 并允许 root 密码登录
 TS_TUN_MODE='userspace-networking'         # 受限容器建议 userspace-networking
@@ -72,7 +72,8 @@ EOF_STATE
 load_state(){ [ -f "$STATE_FILE" ] && source "$STATE_FILE" || true; }
 
 detect_backend(){
-  # Do not trust systemctl binary alone in containers; PID1 may be dumb-init/supervisord.
+  # Containers may ship systemctl/unit files while PID1 is not systemd.
+  # Use systemd only when the system bus is actually available.
   if command -v systemctl >/dev/null 2>&1     && [ -d /run/systemd/system ]     && systemctl is-system-running >/dev/null 2>&1; then
     SERVICE_BACKEND="systemd"
   else

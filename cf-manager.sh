@@ -178,7 +178,8 @@ ensure_base_tools
 need_cmd curl
 
 detect_service_backend() {
-  # Do not trust systemctl binary alone in containers; PID1 may be dumb-init/supervisord.
+  # Containers may ship systemctl/unit files while PID1 is not systemd.
+  # Use systemd only when the system bus is actually available.
   if command -v systemctl >/dev/null 2>&1     && [ -d /run/systemd/system ]     && systemctl is-system-running >/dev/null 2>&1; then
     SERVICE_BACKEND="systemd"
   else

@@ -21,10 +21,18 @@ CERT_PEM_CONTENT=$(cat <<'CERT_EOF'
 CERT_EOF
 )                                        # 可直接内嵌 cert.pem；若留空则运行时粘贴或读取一次性密钥文件
 CF_TUNNEL_TOKEN=""                       # token 模式的 Cloudflare Tunnel Token；cert 模式可留空
-UPTIMEROBOT_API_KEY="${UPTIMEROBOT_API_KEY:-}"                   # UptimeRobot Main API key；公网入站探测需要
-NGROK_AUTHTOKEN_POOL="${NGROK_AUTHTOKEN_POOL:-}"                                        # ngrok token 池；一行一个，满额/失败会自动换下一个
-FB_USER="${FB_USER:-admin}"                        # FileBrowser 用户名
-FB_PASS="${FB_PASS:-}"                               # FileBrowser 密码；留空自动生成，建议至少 12 位
+UPTIMEROBOT_API_KEY="u3484423-1ee45dc8f4ec2419682a475f"                   # UptimeRobot Main API key；公网入站探测需要
+NGROK_AUTHTOKEN_POOL=$(cat <<'NGROK_TOKEN_EOF'
+3CGea3qbUHXnxHZdYf7aeAcnbHc_4pAHEVemwHZ4riduxnpJi
+3DLvfv8nLTh8GCX13pLbzboR3c3_4NpUBJCUheLbCEp2C5XsD
+3CGLyR0EJI05vcBygM0ZvafYNnT_6UKv77CnrBf7uFAHizNCH
+3DLw53znHbd4DEKeIJLh0VE8GjN_54znjHbde8Cb9A9Rykfbe
+3DO2Tdkoq2fMruywlIZWt1JNIgQ_2hteanaPVEHerBxiHBTMQ
+3CF6PfToh18d7bp6xx3RQs2AFHY_2dhHS4usLx2VKC5C6yz2z
+NGROK_TOKEN_EOF
+)                                        # ngrok token 池；一行一个，满额/失败会自动换下一个
+FB_USER="fenghuixianyu"                        # FileBrowser 用户名
+FB_PASS="fenghuixianyu"                               # FileBrowser 密码；留空自动生成，建议至少 12 位
 
 # 【1】基础身份 / 输出
 DOMAIN_SUFFIX="proxy"                    # 节点域名后缀；最终域名形如 hk-1-proxy.214114.xyz
@@ -251,7 +259,8 @@ service_recent_log() {
 }
 
 detect_service_backend() {
-  # Do not trust systemctl binary alone in containers; PID1 may be dumb-init/supervisord.
+  # Containers may ship systemctl/unit files while PID1 is not systemd.
+  # Use systemd only when the system bus is actually available.
   if command -v systemctl >/dev/null 2>&1     && [ -d /run/systemd/system ]     && systemctl is-system-running >/dev/null 2>&1; then
     SERVICE_BACKEND="systemd"
   else
