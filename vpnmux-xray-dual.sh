@@ -34,7 +34,10 @@ AUTO_CONFIGURE_SSH="${AUTO_CONFIGURE_SSH:-on}"
 AUTO_BOOTSTRAP_SSH="${AUTO_BOOTSTRAP_SSH:-on}"
 WAIT_HANDOFF="${WAIT_HANDOFF:-on}"
 AUTO_PUBLIC_FROM_OUTBOUND="${AUTO_PUBLIC_FROM_OUTBOUND:-auto}"
-AUTO_NGROK_PUBLIC="${AUTO_NGROK_PUBLIC:-auto}"
+AUTO_NGROK_PUBLIC="${AUTO_NGROK_PUBLIC:-off}"
+AUTO_SCAN_PLATFORM_ENDPOINT="${AUTO_SCAN_PLATFORM_ENDPOINT:-on}"
+AUTO_WAIT_PUBLIC_ENDPOINT="${AUTO_WAIT_PUBLIC_ENDPOINT:-on}"
+PUBLIC_ENDPOINT_WAIT_SECONDS="${PUBLIC_ENDPOINT_WAIT_SECONDS:-35}"
 ALLOW_PRIVATE_PUBLIC_HOST="${ALLOW_PRIVATE_PUBLIC_HOST:-off}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
@@ -154,6 +157,96 @@ env_var(){
   eval 'printf "%s\n" "${'"$name"':-}"'
 }
 
+parse_endpoint_text(){
+  local _tmp _rc
+  _tmp="$(mktemp)"
+  cat > "$_tmp"
+  python3 - "$_tmp" <<'PY'
+import re, sys
+text=open(sys.argv[1], 'r', encoding='utf-8', errors='ignore').read(2_000_000)
+patterns=[
+    # ssh -p 10946 root@ts6.zocomputer.io
+    (r'ssh\b[^\n\r;]*?-p\s+([0-9]{2,5})[^\n\r;]*?\b(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)', 'port_host'),
+    # ssh root@ts6.zocomputer.io -p 10946
+    (r'ssh\b[^\n\r;]*?\b(?:[A-Za-z0-9_.-]+@)?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)[^\n\r;]*?-p\s+([0-9]{2,5})', 'host_port'),
+    # ssh://root@ts6.zocomputer.io:10946
+    (r'ssh://(?:[^@/\s]+@)?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+):([0-9]{2,5})', 'host_port'),
+    # PUBLIC_HOST=... PUBLIC_PORT=...
+    (r'(?:PUBLIC_HOST|SSH_PUBLIC_HOST|SSH_HOST|ZC_SSH_HOST|ZO_SSH_HOST|ZOCOMPUTER_SSH_HOST)\s*[:=]\s*["\']?([A-Za-z0-9_.-]+\.[A-Za-z0-9_.-]+)["\']?[\s\S]{0,300}?(?:PUBLIC_PORT|SSH_PUBLIC_PORT|SSH_PORT|ZC_SSH_PORT|ZO_SSH_PORT|ZOCOMPUTER_SSH_PORT)\s*[:=]\s*["\']?([0-9]{2,5})', 'host_port'),
+    # generic public host:port, useful for small platform status files
+    (r'\b([A-Za-z0-9_.-]+\.(?:zocomputer\.io|zo[a-z0-9.-]*|ngrok-free\.app|ngrok\.io|tcp\.ngrok\.io|[A-Za-z]{2,}))\s*:\s*([0-9]{2,5})\b', 'host_port'),
+]
+for pat, order in patterns:
+    m=re.search(pat, text, flags=re.I)
+    if not m:
+        continue
+    if order == 'port_host':
+        port, host = m.group(1), m.group(2)
+    else:
+        host, port = m.group(1), m.group(2)
+    print(host, port, '')
+    sys.exit(0)
+
+def pick(name):
+    m=re.search(r'(?im)^\s*'+re.escape(name)+r'\s*=\s*["\']?([^"\'\s#]+)', text)
+    return m.group(1).strip() if m else ''
+host=pick('serverAddr') or pick('server_addr') or pick('server')
+port=pick('remotePort') or pick('remote_port')
+local=pick('localPort') or pick('local_port')
+if host and port:
+    print(host, port, local)
+    sys.exit(0)
+sys.exit(1)
+PY
+  _rc=$?
+  rm -f "$_tmp"
+  return "$_rc"
+}
+
+endpoint_candidate_files(){
+  [ "$AUTO_SCAN_PLATFORM_ENDPOINT" = "on" ] || return 0
+  local d
+  for d in \
+    /__substrate \
+    /etc/zo /etc/zcomputer /etc/modal /etc/frp /etc/frpc \
+    /run /tmp /var/log \
+    /root/.zo /root/.zcomputer /root/.modal /root/.config/zo /root/.config/zcomputer \
+    /workspace/.zo /workspace/.zcomputer /workspace/.modal; do
+    [ -d "$d" ] || continue
+    find "$d" -maxdepth 5 -type f -size -2M \
+      \( -iname '*frpc*' -o -iname '*frp*' -o -iname '*ssh*' -o -iname '*tunnel*' -o -iname '*port*' -o -iname '*endpoint*' -o -iname '*zo*' -o -iname '*zcomputer*' -o -iname '*modal*' -o -iname '*.env' -o -iname '*.json' -o -iname '*.toml' -o -iname '*.log' -o -iname '*.txt' \) \
+      ! -iname 'vpnmux-*' ! -path '/tmp/vpnmux-*' ! -path '/tmp/parse*' \
+      -print 2>/dev/null || true
+  done | awk '!seen[$0]++'
+}
+
+detect_endpoint_from_files(){
+  local file parsed host port local
+  while IFS= read -r file; do
+    [ -r "$file" ] || continue
+    parsed="$(head -c 2000000 "$file" 2>/dev/null | parse_endpoint_text 2>/dev/null || true)"
+    [ -n "$parsed" ] || continue
+    read -r host port local <<<"$parsed"
+    if [ -n "$host" ] && [ -n "$port" ] && host_is_probably_public "$host"; then
+      printf '%s\t%s\t%s\t%s\n' "$host" "$port" "${local:--}" "$file"
+      return 0
+    fi
+  done < <(endpoint_candidate_files)
+  return 1
+}
+
+detect_endpoint_from_processes(){
+  local parsed host port local
+  parsed="$(ps -eo args= 2>/dev/null | grep -Ei 'frpc|ssh|zcomputer|zo[^[:alnum:]]|modal|tunnel' | parse_endpoint_text 2>/dev/null || true)"
+  [ -n "$parsed" ] || return 1
+  read -r host port local <<<"$parsed"
+  if [ -n "$host" ] && [ -n "$port" ] && host_is_probably_public "$host"; then
+    printf '%s\t%s\t%s\tprocess\n' "$host" "$port" "${local:--}"
+    return 0
+  fi
+  return 1
+}
+
 detect_endpoint_from_env(){
   local h p v var parsed
   for var in VPNMUX_PUBLIC_HOST PUBLIC_HOST SSH_PUBLIC_HOST SSH_HOST ZC_SSH_HOST ZO_SSH_HOST ZOCOMPUTER_SSH_HOST; do
@@ -191,6 +284,11 @@ PY
 )"
     [ -n "$parsed" ] && { printf '%s\n' "$parsed"; return 0; }
   done
+  parsed="$(env 2>/dev/null | awk -F= 'BEGIN{IGNORECASE=1} $1 ~ /(SSH|ZO|ZC|ZOCOMPUTER|PUBLIC|TUNNEL|FRP)/ {print}' | parse_endpoint_text 2>/dev/null || true)"
+  if [ -n "$parsed" ]; then
+    printf '%s\n' "$parsed"
+    return 0
+  fi
   return 1
 }
 
@@ -209,12 +307,13 @@ detect_outbound_ip(){
 }
 
 autodetect_public(){
-  local env_ep env_host env_port frp_host frp_port frp_local
+  local env_ep env_host env_port frp_host frp_port frp_local file_ep file_host file_port file_local file_src proc_ep proc_host proc_port proc_local proc_src
   env_ep="$(detect_endpoint_from_env || true)"
   if [ -n "$env_ep" ]; then
     read -r env_host env_port <<<"$env_ep"
     PUBLIC_HOST="${PUBLIC_HOST:-$env_host}"
     PUBLIC_PORT="${PUBLIC_PORT:-$env_port}"
+    [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="env"
   fi
   frp_host="$(parse_frpc_value serverAddr || true)"
   frp_port="$(parse_frpc_value remotePort || true)"
@@ -223,6 +322,25 @@ autodetect_public(){
   PUBLIC_PORT="${PUBLIC_PORT:-$frp_port}"
   MUX_PORT="${MUX_PORT:-$(parse_frpc_value localPort || true)}"
   MUX_PORT="${MUX_PORT:-$frp_local}"
+  if [ -n "$frp_host" ] && [ -n "$frp_port" ] && [ -z "${PUBLIC_SOURCE:-}" ]; then PUBLIC_SOURCE="frpc"; fi
+  file_ep="$(detect_endpoint_from_files || true)"
+  if [ -n "$file_ep" ]; then
+    IFS=$'\t' read -r file_host file_port file_local file_src <<<"$file_ep"
+    [ "$file_local" = "-" ] && file_local=""
+    PUBLIC_HOST="${PUBLIC_HOST:-$file_host}"
+    PUBLIC_PORT="${PUBLIC_PORT:-$file_port}"
+    MUX_PORT="${MUX_PORT:-$file_local}"
+    [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="file:${file_src}"
+  fi
+  proc_ep="$(detect_endpoint_from_processes || true)"
+  if [ -n "$proc_ep" ]; then
+    IFS=$'\t' read -r proc_host proc_port proc_local proc_src <<<"$proc_ep"
+    [ "$proc_local" = "-" ] && proc_local=""
+    PUBLIC_HOST="${PUBLIC_HOST:-$proc_host}"
+    PUBLIC_PORT="${PUBLIC_PORT:-$proc_port}"
+    MUX_PORT="${MUX_PORT:-$proc_local}"
+    [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_SOURCE:-}" ] || PUBLIC_SOURCE="$proc_src"
+  fi
   MUX_PORT="${MUX_PORT:-2222}"
   [ -n "$PUBLIC_PORT" ] || PUBLIC_PORT="$MUX_PORT"
   [ -n "$OUTBOUND_IP" ] || OUTBOUND_IP="$(detect_outbound_ip || true)"
@@ -238,6 +356,7 @@ autodetect_public(){
     warn "探测到的 PUBLIC_HOST=${PUBLIC_HOST} 不是可外部访问的公网名/IP，已忽略。"
     PUBLIC_HOST=""
     PUBLIC_IP=""
+    PUBLIC_SOURCE=""
   fi
   [ -n "$PUBLIC_HOST" ] && [ -n "$PUBLIC_IP" ] || PUBLIC_IP="$(resolve_host_ip "$PUBLIC_HOST" || true)"
 }
@@ -250,9 +369,10 @@ require_public_endpoint(){
 
 当前容器内能打开的 ${MUX_PORT} 只是本地监听；modal:2222 / 127.0.0.1 这类地址属于容器内部地址，不是手机可连接的公网入口。
 
-脚本已经尝试自动补齐容器内 SSH；如果 AUTO_NGROK_PUBLIC 没关，也会尝试用 ngrok TCP 自动构造公网入口。走到这里通常表示：
+脚本已经尝试自动补齐容器内 SSH，并扫描平台状态/日志中的公网入口。当前默认不启用 ngrok；如果你手动设置 AUTO_NGROK_PUBLIC=on，脚本也会尝试用 ngrok TCP 自动构造公网入口。走到这里通常表示：
 - 平台没有原生 SSH/TCP 映射；
-- ngrok token 池为空、失效、额度满，或当前网络无法连接 ngrok。
+- 或者平台已经给了映射，但没有把 SSH 命令/FRP 配置写到容器内可读位置；
+- 若你打开了 ngrok，则可能是 token 池为空、失效、额度满，或当前网络无法连接 ngrok。
 
 解决办法：
 1. 先在平台面板开启 SSH/TCP 端口映射，再重跑脚本；
@@ -406,6 +526,25 @@ ensure_public_endpoint_or_tunnel(){
   if start_ngrok_public; then
     return 0
   fi
+  return 1
+}
+
+wait_for_platform_public_endpoint(){
+  [ "$AUTO_WAIT_PUBLIC_ENDPOINT" = "on" ] || return 0
+  if [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_PORT:-}" ] && host_is_probably_public "$PUBLIC_HOST"; then
+    return 0
+  fi
+  local deadline now
+  deadline=$(( $(date +%s) + PUBLIC_ENDPOINT_WAIT_SECONDS ))
+  log "等待平台生成/写入 SSH 公网入口（最多 ${PUBLIC_ENDPOINT_WAIT_SECONDS}s）"
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    autodetect_public
+    if [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_PORT:-}" ] && host_is_probably_public "$PUBLIC_HOST"; then
+      ok "已发现平台 SSH 公网入口：${PUBLIC_HOST}:${PUBLIC_PORT}（${PUBLIC_SOURCE:-detected}）"
+      return 0
+    fi
+    sleep 2
+  done
   return 1
 }
 
@@ -1153,6 +1292,7 @@ deploy(){
   mkdir -p "$WORK" "$OUT"
   ensure_ssh_server
   ensure_mux_ssh_entry
+  wait_for_platform_public_endpoint || true
   ensure_public_endpoint_or_tunnel || true
   require_public_endpoint
   log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} SOURCE=${PUBLIC_SOURCE:-detected} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
