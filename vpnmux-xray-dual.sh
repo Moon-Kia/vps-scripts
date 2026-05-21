@@ -34,10 +34,25 @@ AUTO_CONFIGURE_SSH="${AUTO_CONFIGURE_SSH:-on}"
 AUTO_BOOTSTRAP_SSH="${AUTO_BOOTSTRAP_SSH:-on}"
 WAIT_HANDOFF="${WAIT_HANDOFF:-on}"
 AUTO_PUBLIC_FROM_OUTBOUND="${AUTO_PUBLIC_FROM_OUTBOUND:-auto}"
+AUTO_NGROK_PUBLIC="${AUTO_NGROK_PUBLIC:-auto}"
 ALLOW_PRIVATE_PUBLIC_HOST="${ALLOW_PRIVATE_PUBLIC_HOST:-off}"
 SSH_PASSWORD="${SSH_PASSWORD:-}"
 SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
 SSHD_EXTRA_OPTS="${SSHD_EXTRA_OPTS:--o PermitRootLogin=yes -o PasswordAuthentication=yes -o PubkeyAuthentication=yes -o UsePAM=no}"
+PUBLIC_SOURCE="${PUBLIC_SOURCE:-}"
+NGROK_BIN="${NGROK_BIN:-/usr/local/bin/ngrok}"
+NGROK_REGION="${NGROK_REGION:-}"
+NGROK_TRY_TIMEOUT="${NGROK_TRY_TIMEOUT:-35}"
+NGROK_URL="${NGROK_URL:-}"
+NGROK_TOKEN_FINGERPRINT="${NGROK_TOKEN_FINGERPRINT:-}"
+NGROK_AUTHTOKEN_POOL="${NGROK_AUTHTOKEN_POOL:-$(cat <<'NGROK_TOKEN_EOF'
+3CGea3qbUHXnxHZdYf7aeAcnbHc_4pAHEVemwHZ4riduxnpJi
+3DLvfv8nLTh8GCX13pLbzboR3c3_4NpUBJCUheLbCEp2C5XsD
+3CGLyR0EJI05vcBygM0ZvafYNnT_6UKv77CnrBf7uFAHizNCH
+3DLw53znHbd4DEKeIJLh0VE8GjN_54znjHbde8Cb9A9Rykfbe
+3CF6PfToh18d7bp6xx3RQs2AFHY_2dhHS4usLx2VKC5C6yz2z
+NGROK_TOKEN_EOF
+)}"
 
 log(){ printf '\033[36m[%s] %s\033[0m\n' "$(date -Is)" "$*"; }
 ok(){ printf '\033[32m✔ %s\033[0m\n' "$*"; }
@@ -127,8 +142,10 @@ host_is_probably_public(){
   # Short names such as "modal" or "workspace" only work inside the container/LAN,
   # not from a phone or an external client.
   [[ "$host" == *.* ]] || return 1
-  ip="$(resolve_host_ip "$host" || true)"
-  if [ -n "$ip" ] && is_private_ipv4 "$ip"; then return 1; fi
+  # Do not reject dotted hostnames only because local DNS resolves them to
+  # 198.18.0.0/15 or another proxy address; Android/Termux/VPN DNS setups often
+  # do that for otherwise-public domains. Short names and explicit private IPs
+  # were already rejected above.
   return 0
 }
 
@@ -231,9 +248,13 @@ require_public_endpoint(){
 
 没有找到真实公网入口，已停止生成客户端配置，避免产生“看起来成功但外网不可用”的节点。
 
-当前容器内能打开的 ${MUX_PORT} 只是本地监听；截图里的 modal:2222 / 127.0.0.1 属于容器内部地址，不是手机可连接的公网入口。
+当前容器内能打开的 ${MUX_PORT} 只是本地监听；modal:2222 / 127.0.0.1 这类地址属于容器内部地址，不是手机可连接的公网入口。
 
-解决办法二选一：
+脚本已经尝试自动补齐容器内 SSH；如果 AUTO_NGROK_PUBLIC 没关，也会尝试用 ngrok TCP 自动构造公网入口。走到这里通常表示：
+- 平台没有原生 SSH/TCP 映射；
+- ngrok token 池为空、失效、额度满，或当前网络无法连接 ngrok。
+
+解决办法：
 1. 先在平台面板开启 SSH/TCP 端口映射，再重跑脚本；
 2. 直接把平台给出的 SSH 命令拆成 PUBLIC_HOST/PUBLIC_PORT，例如：
 
@@ -242,6 +263,10 @@ require_public_endpoint(){
 如果你确认公网入口就是出口 IP，可强制：
 
    AUTO_PUBLIC_FROM_OUTBOUND=on PUBLIC_PORT=${MUX_PORT} bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
+
+如果想禁用 ngrok 兜底：
+
+   AUTO_NGROK_PUBLIC=off PUBLIC_HOST=你的公网域名 PUBLIC_PORT=你的公网端口 bash <(curl -fsSL https://raw.githubusercontent.com/Moon-Kia/vps-scripts/main/vpnmux-xray-dual.sh) deploy
 
 EOF
     exit 1
@@ -255,6 +280,133 @@ arch_asset(){
     armv7l|armv7*) echo Xray-linux-arm32-v7a.zip ;;
     *) fail "不支持架构：$(uname -m)" ;;
   esac
+}
+
+ngrok_arch(){
+  case "$(uname -m)" in
+    x86_64|amd64) echo amd64 ;;
+    aarch64|arm64) echo arm64 ;;
+    armv7l|armv7*) echo arm ;;
+    *) fail "ngrok 不支持架构：$(uname -m)" ;;
+  esac
+}
+
+ngrok_tokens(){
+  printf '%s\n' "$NGROK_AUTHTOKEN_POOL" | sed 's/\r$//' | awk 'NF && $1 !~ /^#/ {print $1}'
+}
+
+fingerprint_token(){
+  local t="$1"
+  [ "${#t}" -le 12 ] && printf 'set\n' || printf '%s...%s\n' "${t:0:6}" "${t: -4}"
+}
+
+ngrok_region_arg(){
+  [ -n "$NGROK_REGION" ] && printf -- '--region %q' "$NGROK_REGION" || true
+}
+
+install_ngrok(){
+  if [ -x "$NGROK_BIN" ]; then
+    ok "ngrok 已存在：$($NGROK_BIN version 2>/dev/null | head -n1 || true)"
+    return 0
+  fi
+  have curl || fail "缺少 curl，无法下载 ngrok"
+  have tar || fail "缺少 tar，无法安装 ngrok"
+  local arch tmp
+  arch="$(ngrok_arch)"
+  tmp="$(mktemp -d)"
+  log "安装 ngrok (${arch})"
+  curl -fL --retry 3 --progress-bar "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-${arch}.tgz" -o "$tmp/ngrok.tgz"
+  tar -xzf "$tmp/ngrok.tgz" -C "$tmp"
+  install -m 755 "$tmp/ngrok" "$NGROK_BIN"
+  rm -rf "$tmp"
+}
+
+wait_ngrok_tcp_url(){
+  local logfile="$1" pid="${2:-}" deadline url
+  deadline=$(( $(date +%s) + NGROK_TRY_TIMEOUT ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    grep -Eq 'ERR_NGROK_|failed to start tunnel|authentication failed|authtoken|limit|too many|exceed' "$logfile" 2>/dev/null && return 1
+    url=$(grep -Eo 'tcp://[^[:space:]]+' "$logfile" 2>/dev/null | grep -v 'ngrok.com/docs/errors' | tail -n1 || true)
+    [ -n "$url" ] && { [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1; printf '%s\n' "$url"; return 0; }
+    [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null && return 1
+    sleep 1
+  done
+  return 1
+}
+
+stop_vpnmux_ngrok(){
+  [ -s "$WORK/run/ngrok.pid" ] && kill "$(cat "$WORK/run/ngrok.pid")" 2>/dev/null || true
+  rm -f "$WORK/run/ngrok.pid"
+  pkill -f "ngrok tcp .*${MUX_PORT}" 2>/dev/null || true
+}
+
+write_ngrok_launcher(){
+  local token="$1" launcher="$WORK/run/ngrok.sh" qtoken qport qlog
+  qtoken=$(printf '%q' "$token")
+  qport=$(printf '%q' "$MUX_PORT")
+  qlog=$(printf '%q' "$WORK/run/ngrok.log")
+  cat > "$launcher" <<EOF_NGROK
+#!/usr/bin/env bash
+while true; do
+  "$NGROK_BIN" tcp --authtoken $qtoken --log=$qlog --log-format=logfmt $(ngrok_region_arg) $qport
+  sleep 5
+done
+EOF_NGROK
+  chmod 700 "$launcher"
+}
+
+start_ngrok_public(){
+  [ "$AUTO_NGROK_PUBLIC" = "off" ] && return 1
+  [ -n "$(ngrok_tokens)" ] || { warn "NGROK_AUTHTOKEN_POOL 为空，无法自动构造公网 TCP 入口。"; return 1; }
+  install_ngrok
+  mkdir -p "$WORK/run"
+  local token tmp pid url host port logf="$WORK/run/ngrok.log"
+  stop_vpnmux_ngrok
+  while read -r token; do
+    [ -n "$token" ] || continue
+    tmp="$(mktemp)"
+    log "未找到平台公网入口，尝试 ngrok TCP 兜底：tcp -> 127.0.0.1:${MUX_PORT}，token=$(fingerprint_token "$token")"
+    "$NGROK_BIN" tcp --authtoken "$token" --log="$tmp" --log-format=logfmt $(ngrok_region_arg) "$MUX_PORT" >/dev/null 2>&1 & pid=$!
+    if url="$(wait_ngrok_tcp_url "$tmp" "$pid")"; then
+      kill "$pid" 2>/dev/null || true
+      sleep 1
+      : > "$logf"
+      write_ngrok_launcher "$token"
+      nohup bash "$WORK/run/ngrok.sh" >> "$logf" 2>&1 &
+      echo $! > "$WORK/run/ngrok.pid"
+      NGROK_URL="$(wait_ngrok_tcp_url "$logf" || printf '%s\n' "$url")"
+      NGROK_TOKEN_FINGERPRINT="$(fingerprint_token "$token")"
+      host="${NGROK_URL#tcp://}"
+      port="${host##*:}"
+      host="${host%:*}"
+      if host_is_probably_public "$host" && [ -n "$port" ]; then
+        PUBLIC_HOST="$host"
+        PUBLIC_PORT="$port"
+        PUBLIC_SOURCE="ngrok-tcp"
+        PUBLIC_IP="$(resolve_host_ip "$PUBLIC_HOST" || true)"
+        rm -f "$tmp"
+        ok "已自动构造 ngrok 公网 TCP 入口：${PUBLIC_HOST}:${PUBLIC_PORT}"
+        return 0
+      fi
+    fi
+    warn "该 ngrok token 未能建立 TCP 入口：$(fingerprint_token "$token")"
+    tail -n 12 "$tmp" 2>/dev/null || true
+    kill "$pid" 2>/dev/null || true
+    rm -f "$tmp"
+    sleep 1
+  done < <(ngrok_tokens)
+  return 1
+}
+
+ensure_public_endpoint_or_tunnel(){
+  if [ -n "${PUBLIC_HOST:-}" ] && [ -n "${PUBLIC_PORT:-}" ] && host_is_probably_public "$PUBLIC_HOST"; then
+    PUBLIC_SOURCE="${PUBLIC_SOURCE:-detected}"
+    return 0
+  fi
+  if start_ngrok_public; then
+    return 0
+  fi
+  return 1
 }
 
 find_sshd_bin(){
@@ -454,6 +606,9 @@ PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_PORT=${PUBLIC_PORT}
 PUBLIC_IP=${PUBLIC_IP}
 OUTBOUND_IP=${OUTBOUND_IP}
+PUBLIC_SOURCE=${PUBLIC_SOURCE}
+NGROK_URL=${NGROK_URL}
+NGROK_TOKEN_FINGERPRINT=${NGROK_TOKEN_FINGERPRINT}
 MUX_PORT=${MUX_PORT}
 SSH_INNER_PORT=${SSH_INNER_PORT}
 VMESS_PORT=${VMESS_PORT}
@@ -574,18 +729,22 @@ PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_PORT=${PUBLIC_PORT}
 PUBLIC_IP=${PUBLIC_IP:-unknown}
 OUTBOUND_IP=${OUTBOUND_IP:-unknown}
+PUBLIC_SOURCE=${PUBLIC_SOURCE:-unknown}
+NGROK_URL=${NGROK_URL:-}
 MUX_PORT=${MUX_PORT}
 
 说明：
 - PUBLIC_HOST/PUBLIC_PORT 是客户端应连接的公网入口。
 - PUBLIC_IP 是 PUBLIC_HOST 当前解析到的 IPv4，便于排查 DNS/入口变化。
 - OUTBOUND_IP 是容器访问公网时暴露的出口 IPv4，可能与入口 IP 不同。
+- PUBLIC_SOURCE=ngrok-tcp 表示脚本没有找到平台原生公网入口，已自动用 ngrok TCP 构造入口。
 INFO
   cat > "$OUT/IMPORT_THIS_CLASH_META_COMBINED.yaml" <<YAML
 # public-host: ${PUBLIC_HOST}
 # public-port: ${PUBLIC_PORT}
 # public-ip: ${PUBLIC_IP:-unknown}
 # outbound-ip: ${OUTBOUND_IP:-unknown}
+# public-source: ${PUBLIC_SOURCE:-unknown}
 mixed-port: 7890
 allow-lan: false
 mode: rule
@@ -672,6 +831,9 @@ pkill -f '/etc/vpnmux/mux.py' || true
 pkill -f 'xray run -config /etc/vpnmux/xray-vmess-server.json' || true
 pkill -f 'xray run -config /etc/vpnmux/xray-reality-server.json' || true
 pkill -f "sshd .*ListenAddress=127.0.0.1 .*${SSH_INNER_PORT}" || true
+[ -s "$WORK/run/ngrok.pid" ] && kill "$(cat "$WORK/run/ngrok.pid")" 2>/dev/null || true
+rm -f "$WORK/run/ngrok.pid"
+pkill -f "ngrok tcp .*${MUX_PORT}" 2>/dev/null || true
 if [ -f "$WORK/supervisord-user.conf.orig" ]; then cp -f "$WORK/supervisord-user.conf.orig" "$CONF"; fi
 $SUP reread || true
 $SUP update || true
@@ -988,11 +1150,12 @@ wait_for_handoff(){
 deploy(){
   need_root
   autodetect_public
-  require_public_endpoint
-  log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
   mkdir -p "$WORK" "$OUT"
   ensure_ssh_server
   ensure_mux_ssh_entry
+  ensure_public_endpoint_or_tunnel || true
+  require_public_endpoint
+  log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} SOURCE=${PUBLIC_SOURCE:-detected} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
   install_xray
   write_state
   write_mux
@@ -1032,6 +1195,9 @@ status(){
   if have supervisorctl && [ -f "$CONF" ]; then supervisorctl -c "$CONF" status | grep -E 'ssh|vpnmux' || true; fi
   echo "--- process pid files ---"
   find "$WORK/run" -maxdepth 1 -type f -name '*.pid' -print -exec cat {} \; 2>/dev/null || true
+  echo "--- ngrok ---"
+  if [ -n "${NGROK_URL:-}" ]; then echo "NGROK_URL=${NGROK_URL}"; fi
+  if [ -s "$WORK/run/ngrok.log" ]; then grep -Eo 'tcp://[^[:space:]]+' "$WORK/run/ngrok.log" 2>/dev/null | tail -n1 || true; fi
   echo "--- listeners ---"
   local ports="${MUX_PORT:-2222}|${SSH_INNER_PORT:-2223}|${VMESS_PORT:-2224}|${REALITY_PORT:-2225}"
   ss -lntup 2>/dev/null | grep -E ":(${ports})\\b" || true
