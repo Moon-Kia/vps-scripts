@@ -29,6 +29,13 @@ REALITY_PORT="${REALITY_PORT:-2225}"
 REALITY_SERVER_NAME="${REALITY_SERVER_NAME:-www.cloudflare.com}"
 REALITY_DEST="${REALITY_DEST:-www.cloudflare.com:443}"
 QUICK_CMD="${QUICK_CMD:-vpnmux}"
+AUTO_INSTALL_SSH="${AUTO_INSTALL_SSH:-on}"
+AUTO_CONFIGURE_SSH="${AUTO_CONFIGURE_SSH:-on}"
+AUTO_BOOTSTRAP_SSH="${AUTO_BOOTSTRAP_SSH:-on}"
+WAIT_HANDOFF="${WAIT_HANDOFF:-on}"
+SSH_PASSWORD="${SSH_PASSWORD:-}"
+SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
+SSHD_EXTRA_OPTS="${SSHD_EXTRA_OPTS:--o PermitRootLogin=yes -o PasswordAuthentication=yes -o PubkeyAuthentication=yes -o UsePAM=no}"
 
 log(){ printf '\033[36m[%s] %s\033[0m\n' "$(date -Is)" "$*"; }
 ok(){ printf '\033[32m✔ %s\033[0m\n' "$*"; }
@@ -100,6 +107,145 @@ arch_asset(){
   esac
 }
 
+find_sshd_bin(){
+  local p
+  for p in "${SSHD_BIN:-}" "$(command -v sshd 2>/dev/null || true)" /usr/sbin/sshd /usr/local/sbin/sshd /usr/bin/sshd; do
+    [ -n "$p" ] || continue
+    [ -x "$p" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+install_ssh_package(){
+  [ "$AUTO_INSTALL_SSH" = "on" ] || fail "缺少 sshd，且 AUTO_INSTALL_SSH!=on，无法自动安装 OpenSSH Server。"
+  log "缺少 sshd，尝试自动安装 OpenSSH Server"
+  if have apt-get; then
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -y
+    apt-get install -y --no-install-recommends openssh-server openssh-client ca-certificates
+  elif have apk; then
+    apk add --no-cache openssh-server openssh-client ca-certificates
+  elif have dnf; then
+    dnf install -y openssh-server openssh-clients ca-certificates
+  elif have yum; then
+    yum install -y openssh-server openssh-clients ca-certificates
+  elif have pacman; then
+    pacman -Sy --noconfirm openssh ca-certificates
+  elif have zypper; then
+    zypper --non-interactive install openssh ca-certificates
+  else
+    fail "缺少 sshd，且未识别可用包管理器；请先安装 openssh-server。"
+  fi
+}
+
+configure_sshd_auth(){
+  [ "$AUTO_CONFIGURE_SSH" = "on" ] || return 0
+  [ -d /etc/ssh ] || return 0
+  mkdir -p /etc/ssh/sshd_config.d 2>/dev/null || true
+  if [ -d /etc/ssh/sshd_config.d ]; then
+    cat > /etc/ssh/sshd_config.d/99-vpnmux.conf <<'EOF'
+# Managed by vpnmux-xray-dual.sh
+PermitRootLogin yes
+PasswordAuthentication yes
+PubkeyAuthentication yes
+UsePAM no
+EOF
+    chmod 600 /etc/ssh/sshd_config.d/99-vpnmux.conf 2>/dev/null || true
+  fi
+}
+
+set_root_password_if_requested(){
+  [ -n "$SSH_PASSWORD" ] || return 0
+  if have chpasswd; then
+    printf 'root:%s\n' "$SSH_PASSWORD" | chpasswd
+    ok "已按 SSH_PASSWORD 设置 root SSH 密码。"
+  else
+    warn "已提供 SSH_PASSWORD，但系统缺少 chpasswd，未能自动设置 root 密码。"
+  fi
+}
+
+ensure_ssh_server(){
+  log "检查 SSH/端口前置条件"
+  if ! SSHD_BIN="$(find_sshd_bin)"; then
+    install_ssh_package
+    SSHD_BIN="$(find_sshd_bin)" || fail "OpenSSH Server 安装后仍找不到 sshd。"
+  fi
+  mkdir -p /run/sshd /var/run/sshd "$WORK/run"
+  chmod 755 /run/sshd /var/run/sshd 2>/dev/null || true
+  if have ssh-keygen; then
+    ssh-keygen -A >/dev/null 2>&1 || true
+  fi
+  configure_sshd_auth
+  set_root_password_if_requested
+  if ! "$SSHD_BIN" -t $SSHD_EXTRA_OPTS >/tmp/vpnmux-sshd-test.out 2>/tmp/vpnmux-sshd-test.err; then
+    warn "sshd 配置自检未通过，稍后仍会尝试用命令行参数启动；详情：/tmp/vpnmux-sshd-test.err"
+  fi
+  ok "SSH 服务端就绪：$SSHD_BIN"
+}
+
+port_has_listener(){
+  local port="$1"
+  if have ss; then
+    ss -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {found=1} END{exit found?0:1}'
+  elif have netstat; then
+    netstat -lnt 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {found=1} END{exit found?0:1}'
+  elif have lsof; then
+    lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1
+  else
+    return 1
+  fi
+}
+
+probe_ssh_banner(){
+  local port="$1"
+  if have ssh-keyscan && have timeout; then
+    timeout 8 ssh-keyscan -p "$port" -T 5 127.0.0.1 >/tmp/vpnmux-keyscan-"$port".out 2>/tmp/vpnmux-keyscan-"$port".err \
+      && [ -s /tmp/vpnmux-keyscan-"$port".out ]
+    return $?
+  fi
+  python3 - "$port" <<'PY' >/tmp/vpnmux-ssh-probe.out 2>/tmp/vpnmux-ssh-probe.err
+import socket, sys
+port=int(sys.argv[1])
+s=socket.create_connection(("127.0.0.1", port), 5)
+s.settimeout(5)
+data=s.recv(64)
+s.close()
+sys.exit(0 if data.startswith(b"SSH-") else 1)
+PY
+}
+
+start_bootstrap_sshd_on_mux(){
+  [ "$AUTO_BOOTSTRAP_SSH" = "on" ] || return 1
+  mkdir -p "$WORK/run" /run/sshd /var/run/sshd
+  if [ -s "$WORK/run/bootstrap-sshd.pid" ]; then
+    kill "$(cat "$WORK/run/bootstrap-sshd.pid")" 2>/dev/null || true
+    rm -f "$WORK/run/bootstrap-sshd.pid"
+  fi
+  log "本地 ${MUX_PORT} 没有 SSH banner，先自动拉起 bootstrap sshd 占位；稍后会切换为 VPNMux。"
+  nohup "$SSHD_BIN" -D -e $SSHD_EXTRA_OPTS -p "$MUX_PORT" >>/dev/shm/vpnmux-bootstrap-sshd.log 2>&1 &
+  echo $! > "$WORK/run/bootstrap-sshd.pid"
+  sleep 2
+  probe_ssh_banner "$MUX_PORT"
+}
+
+ensure_mux_ssh_entry(){
+  if probe_ssh_banner "$MUX_PORT"; then
+    ok "本地端口 ${MUX_PORT} 已有 SSH banner，可作为复用入口。"
+    return 0
+  fi
+
+  if port_has_listener "$MUX_PORT"; then
+    warn "本地端口 ${MUX_PORT} 已被非 SSH 服务占用；后台切换时会尝试接管该端口。"
+    return 0
+  fi
+
+  if start_bootstrap_sshd_on_mux; then
+    ok "已自动打开本地 SSH 入口端口 ${MUX_PORT}。"
+  else
+    warn "无法自动打开本地 SSH 入口端口 ${MUX_PORT}；如果平台没有公网映射，生成的节点可能无法连通。"
+  fi
+}
+
 install_xray(){
   if have xray; then
     xray version | head -n1 || true
@@ -139,9 +285,12 @@ x25519_keys(){
 }
 
 write_state(){
+  local detected_sshd_bin="$SSHD_BIN" detected_sshd_opts="$SSHD_EXTRA_OPTS"
   mkdir -p "$WORK" "$OUT" "$WORK/bootstrap"
   chmod 700 "$WORK" "$WORK/bootstrap" 2>/dev/null || true
   if [ -f "$WORK/state.env" ]; then . "$WORK/state.env" || true; fi
+  SSHD_BIN="$detected_sshd_bin"
+  SSHD_EXTRA_OPTS="$detected_sshd_opts"
   UUID="${UUID:-$(rand_uuid)}"
   WS_PATH="${WS_PATH:-/$(openssl rand -hex 12)-vmess}"
   REALITY_UUID="${REALITY_UUID:-$(rand_uuid)}"
@@ -149,7 +298,8 @@ write_state(){
     read -r REALITY_PRIVATE_KEY REALITY_PUBLIC_KEY < <(x25519_keys)
   fi
   REALITY_SHORT_ID="${REALITY_SHORT_ID:-$(openssl rand -hex 8)}"
-  cat > "$WORK/state.env" <<STATE
+  {
+  cat <<STATE
 PUBLIC_HOST=${PUBLIC_HOST}
 PUBLIC_PORT=${PUBLIC_PORT}
 PUBLIC_IP=${PUBLIC_IP}
@@ -168,6 +318,9 @@ REALITY_PRIVATE_KEY=${REALITY_PRIVATE_KEY}
 REALITY_PUBLIC_KEY=${REALITY_PUBLIC_KEY}
 REALITY_SHORT_ID=${REALITY_SHORT_ID}
 STATE
+  printf 'SSHD_BIN=%q\n' "$SSHD_BIN"
+  printf 'SSHD_EXTRA_OPTS=%q\n' "$SSHD_EXTRA_OPTS"
+  } > "$WORK/state.env"
   chmod 600 "$WORK/state.env"
 }
 
@@ -356,6 +509,11 @@ set +e
 WORK=/etc/vpnmux
 CONF=${SUPERVISOR_CONF:-/etc/zo/supervisord-user.conf}
 SUP="supervisorctl -c $CONF"
+[ -f "$WORK/state.env" ] && . "$WORK/state.env"
+MUX_PORT="${MUX_PORT:-2222}"
+SSH_INNER_PORT="${SSH_INNER_PORT:-2223}"
+SSHD_BIN="${SSHD_BIN:-/usr/sbin/sshd}"
+SSHD_EXTRA_OPTS="${SSHD_EXTRA_OPTS:-}"
 LOG=/dev/shm/vpnmux-restore.log
 exec >>"$LOG" 2>&1
 echo "[$(date -Is)] restore start"
@@ -363,14 +521,15 @@ $SUP stop vpnmux-mux vpnmux-xray-vmess vpnmux-xray-reality ssh || true
 pkill -f '/etc/vpnmux/mux.py' || true
 pkill -f 'xray run -config /etc/vpnmux/xray-vmess-server.json' || true
 pkill -f 'xray run -config /etc/vpnmux/xray-reality-server.json' || true
-pkill -f 'sshd .*ListenAddress=127.0.0.1 .*2223' || true
+pkill -f "sshd .*ListenAddress=127.0.0.1 .*${SSH_INNER_PORT}" || true
 if [ -f "$WORK/supervisord-user.conf.orig" ]; then cp -f "$WORK/supervisord-user.conf.orig" "$CONF"; fi
 $SUP reread || true
 $SUP update || true
 $SUP start ssh || true
 sleep 1
-if ! timeout 2 bash -c '</dev/tcp/127.0.0.1/2222' >/dev/null 2>&1; then
-  nohup /usr/sbin/sshd -D -e -p 2222 >>/dev/shm/vpnmux-fallback-sshd.log 2>&1 &
+mkdir -p /run/sshd /var/run/sshd
+if ! timeout 2 bash -c "</dev/tcp/127.0.0.1/${MUX_PORT}" >/dev/null 2>&1; then
+  nohup "$SSHD_BIN" -D -e $SSHD_EXTRA_OPTS -p "$MUX_PORT" >>/dev/shm/vpnmux-fallback-sshd.log 2>&1 &
 fi
 echo "[$(date -Is)] restore done"
 EOS
@@ -392,7 +551,7 @@ pretest(){
   mkdir -p /run/sshd /var/run/sshd
   for f in /tmp/vpnmux_pre_*.pid; do [ -f "$f" ] && kill "$(cat "$f")" 2>/dev/null || true; done
   rm -f /tmp/vpnmux_pre_*.pid
-  nohup /usr/sbin/sshd -D -e -o ListenAddress=127.0.0.1 -p "$TS" >/dev/shm/vpnmux-pre-sshd.log 2>&1 & echo $! >/tmp/vpnmux_pre_sshd.pid
+  nohup "$SSHD_BIN" -D -e $SSHD_EXTRA_OPTS -o ListenAddress=127.0.0.1 -p "$TS" >/dev/shm/vpnmux-pre-sshd.log 2>&1 & echo $! >/tmp/vpnmux_pre_sshd.pid
   sed "s/\"port\": ${VMESS_PORT}/\"port\": ${TV}/" "$WORK/xray-vmess-server.json" > /tmp/vpnmux-pre-vmess.json
   sed "s/\"port\": ${REALITY_PORT}/\"port\": ${TR}/" "$WORK/xray-reality-server.json" > /tmp/vpnmux-pre-reality.json
   nohup xray run -config /tmp/vpnmux-pre-vmess.json >/dev/shm/vpnmux-pre-vmess.log 2>&1 & echo $! >/tmp/vpnmux_pre_vmess.pid
@@ -424,10 +583,11 @@ patch_supervisor(){
   [ -f "$CONF" ] || fail "找不到 supervisor 配置：$CONF"
   [ -f "$WORK/supervisord-user.conf.orig" ] || cp -a "$CONF" "$WORK/supervisord-user.conf.orig"
   cp -a "$CONF" "$CONF.bak.vpnmux.$(date -u +%Y%m%d-%H%M%S)"
-  python3 - <<PY "$CONF" "$WORK" "$MUX_PORT" "$SSH_INNER_PORT" "$VMESS_PORT" "$REALITY_PORT"
+  python3 - <<PY "$CONF" "$WORK" "$MUX_PORT" "$SSH_INNER_PORT" "$VMESS_PORT" "$REALITY_PORT" "$SSHD_BIN" "$SSHD_EXTRA_OPTS"
 from pathlib import Path
 import sys
-conf=Path(sys.argv[1]); work=sys.argv[2]; mux,ssh,vm,re=sys.argv[3:]
+conf=Path(sys.argv[1]); work=sys.argv[2]; mux,ssh,vm,re=sys.argv[3:7]; sshd_bin=sys.argv[7]; sshd_opts=sys.argv[8]
+sshd_cmd=' '.join(x for x in [sshd_bin, '-D -e', sshd_opts, f'-o ListenAddress=127.0.0.1 -p {ssh}'] if x)
 text=conf.read_text(); lines=text.splitlines(); out=[]; skip=False
 remove={'[program:vpnmux-xray-vmess]','[program:vpnmux-xray-reality]','[program:vpnmux-mux]','[program:vpnmux-xray]','[program:vpnmux-singbox]'}
 for line in lines:
@@ -440,11 +600,26 @@ for line in lines:
     st=line.strip()
     if st.startswith('[') and st.endswith(']'): section=st
     if section == '[program:ssh]' and line.startswith('command='):
-        line=f'command=/usr/sbin/sshd -D -e -o ListenAddress=127.0.0.1 -p {ssh}'
+        line=f'command={sshd_cmd}'
     elif section == '[program:ssh]' and line.startswith('environment='):
         line=f'environment=PORT="{ssh}"'
     out.append(line)
 base='\n'.join(out).rstrip()+"\n"
+if '[program:ssh]' not in {l.strip() for l in lines}:
+    base += f'''
+[program:ssh]
+command={sshd_cmd}
+autostart=true
+autorestart=true
+startretries=20
+startsecs=2
+stdout_logfile=/dev/shm/vpnmux-sshd-inner.log
+stderr_logfile=/dev/shm/vpnmux-sshd-inner_err.log
+stdout_logfile_maxbytes=10MB
+stdout_logfile_backups=3
+stderr_logfile_maxbytes=10MB
+stderr_logfile_backups=3
+'''
 append=f'''
 [program:vpnmux-xray-vmess]
 command=/usr/local/bin/xray run -config {work}/xray-vmess-server.json
@@ -512,8 +687,25 @@ SUP="supervisorctl -c $CONF"
 LOG=/dev/shm/vpnmux-handoff.log
 exec >>"$LOG" 2>&1
 echo "[$(date -Is)] handoff start"
+listener_pids(){
+  local port="$1"
+  if command -v ss >/dev/null 2>&1; then
+    ss -lntp 2>/dev/null | awk -v p=":$port" '$4 ~ p"$" {print $0}' | sed -n 's/.*pid=\([0-9][0-9]*\).*/\1/p' | sort -u
+  elif command -v lsof >/dev/null 2>&1; then
+    lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null | sort -u
+  fi
+}
 $SUP reread
+$SUP stop vpnmux-mux || true
+$SUP stop ssh || true
+for pid in $(listener_pids "$MUX_PORT"); do
+  echo "[$(date -Is)] stopping old listener pid=$pid port=$MUX_PORT"
+  kill "$pid" 2>/dev/null || true
+  sleep 1
+  kill -9 "$pid" 2>/dev/null || true
+done
 $SUP update
+$SUP start ssh vpnmux-xray-vmess vpnmux-xray-reality vpnmux-mux || true
 sleep 6
 $SUP status || true
 ssh_ok=0; ws_ok=0
@@ -565,7 +757,7 @@ start_one(){
   stop_pid "$pidfile"
   nohup bash -lc "$cmd" >>"$log" 2>&1 & echo $! > "$pidfile"
 }
-start_one sshd-inner "/usr/sbin/sshd -D -e -o ListenAddress=127.0.0.1 -p $SSH_INNER_PORT" /dev/shm/vpnmux-sshd-inner.log
+start_one sshd-inner "\"$SSHD_BIN\" -D -e $SSHD_EXTRA_OPTS -o ListenAddress=127.0.0.1 -p $SSH_INNER_PORT" /dev/shm/vpnmux-sshd-inner.log
 start_one xray-vmess "xray run -config $WORK/xray-vmess-server.json" /dev/shm/vpnmux-xray-vmess.log
 start_one xray-reality "xray run -config $WORK/xray-reality-server.json" /dev/shm/vpnmux-xray-reality.log
 sleep 3
@@ -589,7 +781,7 @@ PY_PROCESS_WS
 if [ "$ssh_ok" != 1 ] || [ "$ws_ok" != 1 ]; then
   echo "[$(date -Is)] process self-test failed; fallback to direct sshd on $MUX_PORT"
   stop_pid "$RUN/vpnmux.pid"
-  nohup /usr/sbin/sshd -D -e -p "$MUX_PORT" >>/dev/shm/vpnmux-fallback-sshd.log 2>&1 & echo $! > "$RUN/fallback-sshd.pid"
+  nohup "$SSHD_BIN" -D -e $SSHD_EXTRA_OPTS -p "$MUX_PORT" >>/dev/shm/vpnmux-fallback-sshd.log 2>&1 & echo $! > "$RUN/fallback-sshd.pid"
   exit 1
 fi
 echo "[$(date -Is)] process handoff OK ssh=$ssh_ok ws=$ws_ok"
@@ -597,11 +789,58 @@ EOS_PROCESS_HANDOFF
   chmod 755 "$WORK/bootstrap/process-handoff.sh"
 }
 
+probe_ws_upgrade(){
+  local port="$1"
+  python3 - "$port" "$WS_PATH" "$PUBLIC_HOST" <<'PY' >/tmp/vpnmux-ws-probe.out 2>/tmp/vpnmux-ws-probe.err
+import socket, sys
+port=int(sys.argv[1]); path=sys.argv[2]; host=sys.argv[3]
+s=socket.create_connection(("127.0.0.1", port), 5)
+s.sendall((f"GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+r=s.recv(256)
+s.close()
+sys.exit(0 if b"101" in r.split(b"\r\n",1)[0] else 1)
+PY
+}
+
+probe_public_tcp(){
+  [ -n "$PUBLIC_HOST" ] && [ -n "$PUBLIC_PORT" ] || return 1
+  if have timeout; then
+    timeout 8 bash -c "</dev/tcp/${PUBLIC_HOST}/${PUBLIC_PORT}" >/tmp/vpnmux-public-tcp.out 2>/tmp/vpnmux-public-tcp.err
+  else
+    python3 - "$PUBLIC_HOST" "$PUBLIC_PORT" <<'PY' >/tmp/vpnmux-public-tcp.out 2>/tmp/vpnmux-public-tcp.err
+import socket, sys
+s=socket.create_connection((sys.argv[1], int(sys.argv[2])), 8)
+s.close()
+PY
+  fi
+}
+
+wait_for_handoff(){
+  [ "$WAIT_HANDOFF" = "on" ] || return 0
+  log "等待后台切换完成并做本地连通性验证"
+  local i
+  for i in $(seq 1 35); do
+    if probe_ssh_banner "$MUX_PORT" && probe_ws_upgrade "$MUX_PORT"; then
+      ok "本地验证通过：${MUX_PORT} 同时可分流 SSH 与 VMess-WS。"
+      if probe_public_tcp; then
+        ok "公网入口 TCP 可连接：${PUBLIC_HOST}:${PUBLIC_PORT}"
+      else
+        warn "未能从本机回连公网入口 ${PUBLIC_HOST}:${PUBLIC_PORT}。这可能是平台不支持回环检测；若客户端仍无速度，请优先确认面板/FRP/防火墙是否真的放行该公网端口。"
+      fi
+      return 0
+    fi
+    sleep 1
+  done
+  warn "等待 35 秒后本地验证仍未通过。请执行 ${QUICK_CMD} status，并查看 /dev/shm/vpnmux-handoff.log 或 /dev/shm/vpnmux-process-handoff.log。"
+}
+
 deploy(){
   need_root
   autodetect_public
   log "PUBLIC=${PUBLIC_HOST}:${PUBLIC_PORT} PUBLIC_IP=${PUBLIC_IP:-unknown} OUTBOUND_IP=${OUTBOUND_IP:-unknown} MUX_PORT=${MUX_PORT}"
   mkdir -p "$WORK" "$OUT"
+  ensure_ssh_server
+  ensure_mux_ssh_entry
   install_xray
   write_state
   write_mux
@@ -624,6 +863,7 @@ deploy(){
   fi
   log "开始后台切换。当前 SSH 可能短暂断开。"
   nohup bash "$handoff" >/dev/shm/vpnmux-handoff-launch.log 2>&1 &
+  wait_for_handoff
   ok "已准备完成。客户端配置：$OUT/IMPORT_THIS_CLASH_META_COMBINED.yaml"
   echo "入口信息    : $OUT/endpoint-info.txt"
   echo "VMess URI   : $OUT/vmess-uri.txt"
@@ -634,13 +874,19 @@ deploy(){
 
 status(){
   echo "========== VPNMux status =========="
-  [ -f "$WORK/state.env" ] && awk -F= '$1 !~ /PRIVATE/ {print}' "$WORK/state.env" || true
+  [ -f "$WORK/state.env" ] && . "$WORK/state.env" || true
+  [ -f "$WORK/state.env" ] && awk -F= '$1 !~ /PRIVATE|SSHD_EXTRA_OPTS/ {print}' "$WORK/state.env" || true
   echo "--- supervisor ---"
   if have supervisorctl && [ -f "$CONF" ]; then supervisorctl -c "$CONF" status | grep -E 'ssh|vpnmux' || true; fi
   echo "--- process pid files ---"
   find "$WORK/run" -maxdepth 1 -type f -name '*.pid' -print -exec cat {} \; 2>/dev/null || true
   echo "--- listeners ---"
-  ss -lntup 2>/dev/null | grep -E ':(2222|2223|2224|2225)\b' || true
+  local ports="${MUX_PORT:-2222}|${SSH_INNER_PORT:-2223}|${VMESS_PORT:-2224}|${REALITY_PORT:-2225}"
+  ss -lntup 2>/dev/null | grep -E ":(${ports})\\b" || true
+  echo "--- local probes ---"
+  if probe_ssh_banner "${MUX_PORT:-2222}"; then echo "SSH banner on mux port: OK"; else echo "SSH banner on mux port: FAIL"; fi
+  if [ -n "${WS_PATH:-}" ] && [ -n "${PUBLIC_HOST:-}" ] && probe_ws_upgrade "${MUX_PORT:-2222}"; then echo "VMess-WS upgrade on mux port: OK"; else echo "VMess-WS upgrade on mux port: FAIL"; fi
+  if probe_public_tcp; then echo "public TCP ${PUBLIC_HOST}:${PUBLIC_PORT}: OK"; else echo "public TCP ${PUBLIC_HOST:-unknown}:${PUBLIC_PORT:-unknown}: unchecked/fail"; fi
   echo "--- files ---"
   ls -l "$OUT" 2>/dev/null || true
 }
